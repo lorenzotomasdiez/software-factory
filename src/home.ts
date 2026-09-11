@@ -38,6 +38,7 @@ const DEFAULT_EXTENSION = `// software-factory's default Pi extension.
 // Besides the status line, this streams session events (JSON lines) into
 // ~/.software-factory/events/<session_id>.jsonl for \`sf dashboard\` to read.
 
+import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -109,15 +110,17 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(\`Scouting: \${args} (background team launched, see \${process.env.SF_DASHBOARD_URL || "sf dashboard"})\`, "info");
-      const proc = Bun.spawn({
-        cmd: ["sf", "workflow", "scout-context", args],
-        stdout: "pipe",
-        stderr: "pipe",
-        cwd: ctx.cwd,
-      });
-      const [report, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      const { report, err, exitCode } = await new Promise<{ report: string; err: string; exitCode: number }>(
+        (resolve) => {
+          const proc = spawn("sf", ["workflow", "scout-context", args], { cwd: ctx.cwd });
+          let out = "";
+          let errOut = "";
+          proc.stdout.on("data", (chunk) => (out += chunk));
+          proc.stderr.on("data", (chunk) => (errOut += chunk));
+          proc.on("close", (code) => resolve({ report: out, err: errOut, exitCode: code ?? 1 }));
+        },
+      );
       if (exitCode !== 0) {
-        const err = await new Response(proc.stderr).text();
         ctx.ui.notify(\`scout-context failed: \${err.slice(0, 300)}\`, "error");
         return;
       }
