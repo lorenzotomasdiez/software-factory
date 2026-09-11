@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { type AgentDefaults, AGENT_FILE, ROOT_DIR, ensureHome, readConfig } from "./home";
+import { type AgentDefaults, AGENT_FILE, DEFAULT_EXTENSION_FILE, ROOT_DIR, ensureHome, readConfig } from "./home";
 import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profiles";
 
 const AGENTS = {
@@ -81,6 +81,12 @@ function buildDefaultArgs(defaults: AgentDefaults, passthrough: string[]): strin
   return args;
 }
 
+/** Reads the value following `flag` in args, if present. */
+function extractFlagValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx === -1 ? undefined : args[idx + 1];
+}
+
 /**
  * process.argv[1] is always the entrypoint path (Bun.main), whether that's
  * src/cli.ts under `bun run` or the virtual bunfs path in a compiled binary.
@@ -138,16 +144,35 @@ async function main(): Promise<void> {
   const defaults: AgentDefaults = config.agents?.[first] ?? {};
   const defaultArgs = buildDefaultArgs(defaults, passthrough);
 
+  // Isolate the launched session from the user's own global/project setup
+  // (~/AGENTS.md, ~/CLAUDE.md, globally installed skills/extensions/plugins)
+  // so `sf` only brings what software-factory itself configures.
+  const isolationArgs =
+    first === "pi"
+      ? ["--no-context-files", "--no-skills", "--no-extensions"]
+      : ["--safe-mode"];
+  const extensionArgs = first === "pi" ? ["-e", DEFAULT_EXTENSION_FILE] : [];
+
   const childArgs = systemPrompt
-    ? ["--append-system-prompt", systemPrompt, ...defaultArgs, ...passthrough]
-    : [...defaultArgs, ...passthrough];
+    ? ["--append-system-prompt", systemPrompt, ...isolationArgs, ...defaultArgs, ...extensionArgs, ...passthrough]
+    : [...isolationArgs, ...defaultArgs, ...extensionArgs, ...passthrough];
   const binary = AGENTS[first];
+
+  const env: Record<string, string> = { ...process.env };
+  if (first === "pi") {
+    env.SF_PROFILE = profile ?? "default";
+    const effectiveProvider = extractFlagValue(passthrough, "--provider") ?? defaults.provider;
+    const effectiveModel = extractFlagValue(passthrough, "--model") ?? defaults.model;
+    if (effectiveProvider) env.SF_PROVIDER = effectiveProvider;
+    if (effectiveModel) env.SF_MODEL = effectiveModel;
+  }
 
   try {
     const proc = Bun.spawn({
       cmd: [binary, ...childArgs],
       stdio: ["inherit", "inherit", "inherit"],
       cwd: process.cwd(),
+      env,
     });
     const exitCode = await proc.exited;
     process.exit(exitCode);
