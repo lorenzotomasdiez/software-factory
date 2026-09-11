@@ -2,6 +2,8 @@
 import { type AgentDefaults, AGENT_FILE, DEFAULT_EXTENSION_FILE, ROOT_DIR, ensureHome, readConfig } from "./home";
 import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profiles";
 import { DEFAULT_DASHBOARD_PORT, ensureDashboardRunning, startDashboard } from "./dashboard";
+import { claudeIsolationArgs, piExtensionArgs, piIsolationArgs } from "./agent-launch";
+import { runScoutContext } from "./workflows/scout-context";
 
 const AGENTS = {
   claude: "claude",
@@ -21,11 +23,21 @@ Usage:
   sf <agent> [--profile <name>] [-- ...args passed to the agent]
   sf profiles
   sf dashboard [--port <n>]
+  sf workflow scout-context "<topic>"
   sf --help
 
 Agents:
   claude    Launch Claude Code in the current directory
   pi        Launch Pi in the current directory
+
+Workflows:
+  scout-context   Deterministic multi-agent recon: spawns read-only scout
+                  agents in parallel (structure, data flow, conventions),
+                  merges their findings, and prints only the final report.
+                  Runs in the background from inside \`sf pi\` via
+                  /scout-context <topic>, or standalone via the CLI above.
+                  Traced in the dashboard as one workflow with a lane per
+                  scout.
 
 Options:
   --profile <name>   Optional add-on profile, appended on top of the base prompt
@@ -43,6 +55,7 @@ Config lives in ${ROOT_DIR}:
   extensions/         reserved for future harness extensions
   hooks/              reserved for future harness hooks
   events/             per-session JSONL event trace, read by \`sf dashboard\`
+  workflows/<id>/report.md   scout-context reports, one per run
 
 Examples:
   sf claude
@@ -130,6 +143,22 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (first === "workflow") {
+    const [name, ...rest] = args.slice(1);
+    if (name === "scout-context") {
+      const topic = rest.join(" ").trim();
+      if (!topic) {
+        console.error('sf: usage: sf workflow scout-context "<topic>"');
+        process.exit(1);
+      }
+      const result = await runScoutContext(topic);
+      console.log(result.report);
+      process.exit(result.ok ? 0 : 1);
+    }
+    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context`);
+    process.exit(1);
+  }
+
   if (first === "dashboard") {
     const rest = args.slice(1);
     const internal = rest.includes("--internal-serve");
@@ -167,11 +196,8 @@ async function main(): Promise<void> {
   // Isolate the launched session from the user's own global/project setup
   // (~/AGENTS.md, ~/CLAUDE.md, globally installed skills/extensions/plugins)
   // so `sf` only brings what software-factory itself configures.
-  const isolationArgs =
-    first === "pi"
-      ? ["--no-context-files", "--no-skills", "--no-extensions"]
-      : ["--safe-mode"];
-  const extensionArgs = first === "pi" ? ["-e", DEFAULT_EXTENSION_FILE] : [];
+  const isolationArgs = first === "pi" ? piIsolationArgs() : claudeIsolationArgs();
+  const extensionArgs = first === "pi" ? piExtensionArgs() : [];
 
   const childArgs = systemPrompt
     ? ["--append-system-prompt", systemPrompt, ...isolationArgs, ...defaultArgs, ...extensionArgs, ...passthrough]

@@ -48,6 +48,7 @@ const EVENTS_DIR = join(homedir(), ".software-factory", "events");
 function emit(sessionId: string, type: string, data?: unknown) {
   try {
     mkdirSync(EVENTS_DIR, { recursive: true });
+    const workflowId = process.env.SF_WORKFLOW_ID;
     const line = JSON.stringify({
       ts: new Date().toISOString(),
       session_id: sessionId,
@@ -55,10 +56,15 @@ function emit(sessionId: string, type: string, data?: unknown) {
       profile: process.env.SF_PROFILE || "default",
       provider: process.env.SF_PROVIDER,
       model: process.env.SF_MODEL,
+      workflow_id: workflowId,
+      role: process.env.SF_ROLE,
       type,
       data,
     });
-    appendFileSync(join(EVENTS_DIR, \`\${sessionId}.jsonl\`), line + "\\n");
+    // Scout children write into the parent workflow's own event file so the
+    // dashboard groups them as one swim-laned trace instead of N loose sessions.
+    const file = workflowId ? \`\${workflowId}.jsonl\` : \`\${sessionId}.jsonl\`;
+    appendFileSync(join(EVENTS_DIR, file), line + "\\n");
   } catch {
     // observability must never break the session
   }
@@ -93,6 +99,33 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     emit(sessionId, "session_end", { reason: event.reason });
+  });
+
+  pi.registerCommand("scout-context", {
+    description: "Launch a team of read-only scout agents to map the codebase around a topic",
+    handler: async (args, ctx) => {
+      if (!args?.trim()) {
+        ctx.ui.notify("Usage: /scout-context <topic>", "warning");
+        return;
+      }
+      ctx.ui.notify(\`Scouting: \${args} (background team launched, see \${process.env.SF_DASHBOARD_URL || "sf dashboard"})\`, "info");
+      const proc = Bun.spawn({
+        cmd: ["sf", "workflow", "scout-context", args],
+        stdout: "pipe",
+        stderr: "pipe",
+        cwd: ctx.cwd,
+      });
+      const [report, exitCode] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+      if (exitCode !== 0) {
+        const err = await new Response(proc.stderr).text();
+        ctx.ui.notify(\`scout-context failed: \${err.slice(0, 300)}\`, "error");
+        return;
+      }
+      pi.sendUserMessage(
+        \`Here is the scout-context report on "\${args}". Use it to answer, don't re-scout unless it's missing something:\\n\\n\${report}\`,
+        { deliverAs: "followUp" },
+      );
+    },
   });
 }
 `;
