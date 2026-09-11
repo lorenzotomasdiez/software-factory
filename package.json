@@ -9,5 +9,8 @@
   "scripts": {
     "build": "bun build ./src/cli.ts --compile --outfile ./dist/sf",
     "dev": "bun run ./src/cli.ts"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.2"
   }
 }

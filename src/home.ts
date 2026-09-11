@@ -9,6 +9,7 @@ export const PROFILES_DIR = join(ROOT_DIR, "profiles");
 export const EXTENSIONS_DIR = join(ROOT_DIR, "extensions");
 export const DEFAULT_EXTENSION_FILE = join(EXTENSIONS_DIR, "default.ts");
 export const HOOKS_DIR = join(ROOT_DIR, "hooks");
+export const EVENTS_DIR = join(ROOT_DIR, "events");
 
 const DEFAULT_AGENT_MD = `# AGENT.md
 
@@ -33,16 +34,65 @@ export interface SfConfig {
 const DEFAULT_EXTENSION = `// software-factory's default Pi extension.
 // Loaded automatically on every \`sf pi\` launch (via -e), not on bare \`pi\`.
 // Edit freely - this file is yours.
+//
+// Besides the status line, this streams session events (JSON lines) into
+// ~/.software-factory/events/<session_id>.jsonl for \`sf dashboard\` to read.
 
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const EVENTS_DIR = join(homedir(), ".software-factory", "events");
+
+function emit(sessionId: string, type: string, data?: unknown) {
+  try {
+    mkdirSync(EVENTS_DIR, { recursive: true });
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      session_id: sessionId,
+      agent: "pi",
+      profile: process.env.SF_PROFILE || "default",
+      provider: process.env.SF_PROVIDER,
+      model: process.env.SF_MODEL,
+      type,
+      data,
+    });
+    appendFileSync(join(EVENTS_DIR, \`\${sessionId}.jsonl\`), line + "\\n");
+  } catch {
+    // observability must never break the session
+  }
+}
+
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event, ctx) => {
+  let sessionId = "unknown";
+
+  pi.on("session_start", async (event, ctx) => {
+    sessionId = ctx.sessionManager.getSessionId?.() ?? sessionId;
     const profile = process.env.SF_PROFILE || "default";
     const provider = process.env.SF_PROVIDER;
     const model = process.env.SF_MODEL;
+    const dashboardUrl = process.env.SF_DASHBOARD_URL;
     const modelPart = provider && model ? \` · \${provider}/\${model}\` : "";
-    ctx.ui.setStatus("software-factory", \`🏭 sf · \${profile}\${modelPart}\`);
+    const obsPart = dashboardUrl ? \` · obs: \${dashboardUrl}\` : "";
+    ctx.ui.setStatus("software-factory", \`🏭 sf · \${profile}\${modelPart}\${obsPart}\`);
+    emit(sessionId, "session_start", { reason: event.reason });
+  });
+
+  pi.on("tool_execution_start", async (event) => {
+    emit(sessionId, "tool_call", { toolName: event.toolName, toolCallId: event.toolCallId, args: event.args });
+  });
+
+  pi.on("tool_execution_end", async (event) => {
+    emit(sessionId, "tool_result", { toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError });
+  });
+
+  pi.on("turn_end", async (event) => {
+    emit(sessionId, "turn_end", { turnIndex: event.turnIndex });
+  });
+
+  pi.on("session_shutdown", async (event) => {
+    emit(sessionId, "session_end", { reason: event.reason });
   });
 }
 `;
@@ -59,6 +109,7 @@ export function ensureHome(): void {
   mkdirSync(PROFILES_DIR, { recursive: true });
   mkdirSync(EXTENSIONS_DIR, { recursive: true });
   mkdirSync(HOOKS_DIR, { recursive: true });
+  mkdirSync(EVENTS_DIR, { recursive: true });
 
   if (!existsSync(AGENT_FILE)) {
     writeFileSync(AGENT_FILE, DEFAULT_AGENT_MD);

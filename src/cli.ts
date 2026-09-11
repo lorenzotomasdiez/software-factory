@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { type AgentDefaults, AGENT_FILE, DEFAULT_EXTENSION_FILE, ROOT_DIR, ensureHome, readConfig } from "./home";
 import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profiles";
+import { DEFAULT_DASHBOARD_PORT, ensureDashboardRunning, startDashboard } from "./dashboard";
 
 const AGENTS = {
   claude: "claude",
@@ -19,6 +20,7 @@ function printUsage(): void {
 Usage:
   sf <agent> [--profile <name>] [-- ...args passed to the agent]
   sf profiles
+  sf dashboard [--port <n>]
   sf --help
 
 Agents:
@@ -28,12 +30,19 @@ Agents:
 Options:
   --profile <name>   Optional add-on profile, appended on top of the base prompt
 
+Observability:
+  Every \`sf claude\`/\`sf pi\` launch auto-starts a local event dashboard
+  (default http://localhost:${DEFAULT_DASHBOARD_PORT}) if one isn't already running,
+  and prints its URL before handing off to the agent.
+  Run \`sf dashboard\` yourself to open it in the foreground.
+
 Config lives in ${ROOT_DIR}:
   AGENT.md            base system prompt, always applied
   profiles/<name>/AGENT.md   optional add-on, applied with --profile <name>
   config.json         harness config, incl. default --provider/--model per agent
   extensions/         reserved for future harness extensions
   hooks/              reserved for future harness hooks
+  events/             per-session JSONL event trace, read by \`sf dashboard\`
 
 Examples:
   sf claude
@@ -121,6 +130,17 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (first === "dashboard") {
+    const rest = args.slice(1);
+    const internal = rest.includes("--internal-serve");
+    const port = Number(extractFlagValue(rest, "--port") ?? DEFAULT_DASHBOARD_PORT);
+    startDashboard(port);
+    if (!internal) {
+      console.log(`sf dashboard running at http://localhost:${port} (Ctrl+C to stop)`);
+    }
+    return; // keep the process alive; Bun.serve holds the event loop open
+  }
+
   if (!isAgentName(first)) {
     console.error(`sf: unknown agent "${first}". Expected one of: ${Object.keys(AGENTS).join(", ")}`);
     process.exit(1);
@@ -158,7 +178,7 @@ async function main(): Promise<void> {
     : [...isolationArgs, ...defaultArgs, ...extensionArgs, ...passthrough];
   const binary = AGENTS[first];
 
-  const env: Record<string, string> = { ...process.env };
+  const env: Record<string, string | undefined> = { ...process.env };
   if (first === "pi") {
     env.SF_PROFILE = profile ?? "default";
     const effectiveProvider = extractFlagValue(passthrough, "--provider") ?? defaults.provider;
@@ -166,6 +186,10 @@ async function main(): Promise<void> {
     if (effectiveProvider) env.SF_PROVIDER = effectiveProvider;
     if (effectiveModel) env.SF_MODEL = effectiveModel;
   }
+
+  const dashboardUrl = await ensureDashboardRunning();
+  env.SF_DASHBOARD_URL = dashboardUrl;
+  console.log(`🏭 sf observability: ${dashboardUrl}`);
 
   try {
     const proc = Bun.spawn({
