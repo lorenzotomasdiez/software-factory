@@ -1,0 +1,13 @@
+{
+  "name": "software-factory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "sf": "./src/cli.ts"
+  },
+  "scripts": {
+    "build": "bun build ./src/cli.ts --compile --outfile ./dist/sf",
+    "dev": "bun run ./src/cli.ts"
+  }
+}
