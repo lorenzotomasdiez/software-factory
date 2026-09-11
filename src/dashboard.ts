@@ -120,8 +120,8 @@ const PAGE = `<!doctype html>
 <title>software-factory dashboard</title>
 <style>
   :root {
-    --bg: #0b0b0d; --panel: #131316; --border: #26262b; --text: #e6e6e6;
-    --dim: #8a8a92; --accent: #9d7bff; --green: #4caf50; --blue: #2196f3;
+    --bg: #0b0b0d; --panel: #131316; --panel2: #18181c; --border: #26262b; --border-soft: #1d1d21; --text: #e6e6e6;
+    --dim: #8a8a92; --faint: #5a5a62; --accent: #9d7bff; --green: #4caf50; --blue: #2196f3;
     --orange: #ff9800; --red: #e5484d;
   }
   * { box-sizing: border-box; }
@@ -132,37 +132,81 @@ const PAGE = `<!doctype html>
   header .live { color: var(--green); font-size: 11px; }
   header .live.stale { color: var(--red); }
   main { flex: 1; display: flex; min-height: 0; }
-  #sessions { width: 320px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
-  .session-item { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
-  .session-item:hover { background: var(--panel); }
-  .session-item.active { background: var(--panel); border-left: 3px solid var(--accent); }
-  .session-item .row1 { display: flex; justify-content: space-between; align-items: center; }
-  .session-item .agent { font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-  .session-item .agent.pi { color: var(--blue); }
-  .session-item .agent.claude { color: var(--orange); }
-  .session-item .agent.workflow { color: var(--accent); }
-  .session-item .topic { color: var(--text); font-size: 12px; margin-top: 3px; font-weight: 600; }
-  .lanes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-  .lane-badge { font-size: 9px; padding: 1px 5px; border-radius: 6px; border: 1px solid var(--border); color: var(--dim); }
-  .lane-badge.ended { color: var(--green); border-color: var(--green); }
-  .role-tag { font-size: 10px; padding: 0 5px; border-radius: 6px; background: #1e1e24; color: var(--accent); }
+  #sessions { width: 300px; border-right: 1px solid var(--border); overflow-y: auto; flex-shrink: 0; }
+  #detail { flex: 1; overflow-y: auto; }
+  #detail .empty, #sessions .empty { color: var(--dim); padding: 40px 20px; text-align: center; }
+
+  /* ── session list cards ─────────────────────────────────────────────── */
+  .card { padding: 10px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .card:hover { background: var(--panel); }
+  .card.active { background: var(--panel); border-left: 3px solid var(--accent); }
+  .card .row1 { display: flex; justify-content: space-between; align-items: center; }
+  .card .agent { font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+  .card .agent.pi { color: var(--blue); }
+  .card .agent.claude { color: var(--orange); }
+  .card .agent.workflow { color: var(--accent); }
+  .card .topic { color: var(--text); font-size: 12px; margin-top: 3px; font-weight: 600; }
   .badge { font-size: 10px; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--dim); }
-  .badge.running { color: var(--green); border-color: var(--green); }
-  .session-item .meta { color: var(--dim); font-size: 11px; margin-top: 3px; }
-  .session-item .idshort { color: var(--dim); font-size: 10px; margin-top: 2px; }
-  #timeline { flex: 1; overflow-y: auto; padding: 14px 18px; }
-  #timeline .empty { color: var(--dim); padding: 40px; text-align: center; }
-  .event { border-left: 3px solid #333; padding: 6px 10px; margin-bottom: 6px; border-radius: 0 4px 4px 0; background: var(--panel); }
-  .event.session_start, .event.session_end { border-color: var(--green); }
-  .event.tool_call { border-color: var(--blue); }
-  .event.tool_result.error { border-color: var(--red); }
-  .event.tool_result { border-color: var(--orange); }
-  .event.turn_end { border-color: #555; opacity: 0.7; }
-  .event .line1 { display: flex; gap: 8px; align-items: baseline; }
-  .ts { color: var(--dim); font-size: 11px; }
-  .type { font-weight: 700; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
-  .toolname { color: var(--accent); font-weight: 600; }
-  pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; color: var(--dim); font-size: 11.5px; }
+  .badge.running { color: var(--blue); border-color: var(--blue); }
+  .badge.ended { color: var(--green); border-color: var(--green); }
+  .badge.failed { color: var(--red); border-color: var(--red); }
+  .card .meta { color: var(--dim); font-size: 11px; margin-top: 3px; }
+  .card .idshort { color: var(--faint); font-size: 10px; margin-top: 2px; }
+  .mini-tl { position: relative; height: 6px; margin-top: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+  .mini-dot { position: absolute; top: 0; bottom: 0; width: 2px; }
+  .mini-rows { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+
+  /* ── waterfall (detail view) ────────────────────────────────────────── */
+  .run-strip { display: flex; align-items: center; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--border-soft); flex-wrap: wrap; }
+  .run-strip .topic { font-size: 14px; font-weight: 600; }
+  .waterfall { margin: 16px 18px; border: 1px solid var(--border-soft); border-radius: 10px; overflow: hidden; }
+  .wf-row { display: grid; grid-template-columns: 200px 1fr; border-bottom: 1px solid var(--border-soft); }
+  .wf-row:last-child { border-bottom: none; }
+  .wf-row.axis { background: var(--panel2); border-bottom: 1px solid var(--border); }
+  .wf-label { padding: 8px 12px; display: flex; flex-direction: column; justify-content: center; gap: 4px; border-right: 1px solid var(--border); overflow: hidden; }
+  .wf-label .name { font-weight: 700; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .wf-label .model { font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ctx-bar { height: 4px; border-radius: 2px; background: var(--panel2); overflow: hidden; margin-top: 2px; }
+  .ctx-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--blue)); }
+  .wf-track { position: relative; height: 52px; }
+  .axis .wf-track { height: 26px; }
+  .axis-tick { position: absolute; bottom: 4px; transform: translateX(-50%); font-size: 10px; color: var(--faint); white-space: nowrap; }
+  .axis-tick.edge { transform: none; }
+  .gridline { position: absolute; top: 0; bottom: 0; border-left: 1px dashed rgba(174,191,212,0.10); }
+  .block { position: absolute; top: 8px; height: 36px; border-radius: 6px; border: 1px solid; padding: 4px 8px; overflow: hidden;
+           white-space: nowrap; cursor: pointer; display: flex; align-items: center; gap: 6px; font-size: 11px; transition: box-shadow .15s ease; }
+  .block:hover { box-shadow: 0 0 12px rgba(157,123,255,0.25); }
+  .block.selected { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .block.running { animation: pulse 1.6s ease-in-out infinite; }
+  .glyph { flex: none; font-size: 11px; }
+  .glyph.ended { color: var(--green); }
+  .glyph.failed { color: var(--red); }
+  .glyph.running { color: var(--blue); }
+  .b-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
+  .b-dur { margin-left: auto; color: var(--dim); font-size: 10px; flex: none; }
+  .tool-tick { position: absolute; bottom: 3px; width: 2px; height: 7px; background: currentColor; opacity: 0.6; border-radius: 1px; }
+  .tool-tick.err { background: var(--red); opacity: 1; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+  /* ── lane drill-down panel ──────────────────────────────────────────── */
+  #lane-detail { margin: 0 18px 24px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--panel); }
+  #lane-detail .ld-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--border-soft); }
+  #lane-detail .ld-head .name { font-weight: 700; font-size: 13px; }
+  #lane-detail .ld-head .close { cursor: pointer; color: var(--dim); font-size: 16px; background: none; border: none; }
+  #lane-detail .ld-head .close:hover { color: var(--text); }
+  #lane-detail .ld-body { max-height: 340px; overflow-y: auto; padding: 8px 14px; }
+  .ld-event { border-left: 3px solid #333; padding: 5px 10px; margin-bottom: 5px; border-radius: 0 4px 4px 0; background: var(--panel2); font-size: 11.5px; }
+  .ld-event.tool_call { border-color: var(--blue); }
+  .ld-event.tool_result { border-color: var(--orange); }
+  .ld-event.tool_result.err { border-color: var(--red); }
+  .ld-event.scout_end, .ld-event.session_end { border-color: var(--green); }
+  .ld-event.scout_end.failed { border-color: var(--red); }
+  .ld-event.gate_result { border-color: var(--accent); }
+  .ld-event .ld-line1 { display: flex; gap: 8px; align-items: baseline; }
+  .ld-ts { color: var(--dim); font-size: 10px; }
+  .ld-type { font-weight: 700; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; }
+  .ld-tool { color: var(--accent); font-weight: 600; }
+  .ld-detail-pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; color: var(--dim); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -172,11 +216,20 @@ const PAGE = `<!doctype html>
 </header>
 <main>
   <div id="sessions"></div>
-  <div id="timeline"><div class="empty">Select a session</div></div>
+  <div id="detail"><div class="empty">Select a session</div></div>
 </main>
 <script>
-  let selected = null;
+  const PALETTE = ["#9d7bff", "#2196f3", "#4caf50", "#ff9800", "#e5484d", "#00bcd4", "#ffc107"];
+  let selectedId = null;
+  let selectedLane = null;
   let sessions = [];
+  const eventsCache = new Map();
+
+  function hashColor(role) {
+    let h = 0;
+    for (let i = 0; i < role.length; i++) h = (h * 31 + role.charCodeAt(i)) >>> 0;
+    return PALETTE[h % PALETTE.length];
+  }
 
   function timeAgo(iso) {
     const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -185,14 +238,96 @@ const PAGE = `<!doctype html>
     return Math.floor(s / 3600) + "h ago";
   }
 
+  function fmtOffset(ms) {
+    const s = Math.round(ms / 1000);
+    if (s < 60) return "+" + s + "s";
+    const m = Math.floor(s / 60), rs = s % 60;
+    return "+" + m + "m" + (rs ? rs + "s" : "");
+  }
+
+  function fmtDur(ms) {
+    if (!Number.isFinite(ms)) return "";
+    const s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + "s";
+    return Math.floor(s / 60) + "m" + Math.round(s % 60) + "s";
+  }
+
+  function axisTicks(spanMs, count) {
+    const ticks = [];
+    for (let i = 0; i <= count; i++) ticks.push({ pct: (i / count) * 100, label: fmtOffset((spanMs * i) / count) });
+    return ticks;
+  }
+
+  /** Groups a session/workflow's raw events into one lane per agent role, with
+   *  real start/end timestamps so the waterfall can position blocks by actual
+   *  elapsed time instead of arrival order. */
+  function computeLanes(events, fallbackAgent) {
+    const byRole = new Map();
+    for (const e of events) {
+      const role = e.role && e.role !== "orchestrator" ? e.role : (e.workflow_id ? null : (fallbackAgent || "agent"));
+      if (!role) continue;
+      if (!byRole.has(role)) byRole.set(role, []);
+      byRole.get(role).push(e);
+    }
+    const lanes = [];
+    for (const [role, evts] of byRole) {
+      evts.sort((a, b) => new Date(a.ts) - new Date(b.ts));
+      const start = new Date(evts[0].ts).getTime();
+      const endEvt = evts.find(e => e.type === "session_end" || e.type === "scout_end");
+      const failed = Boolean(endEvt && endEvt.data && endEvt.data.ok === false);
+      const running = !endEvt;
+      const end = endEvt ? new Date(endEvt.ts).getTime() : Date.now();
+      const toolCalls = evts.filter(e => e.type === "tool_call").map(e => ({ ts: new Date(e.ts).getTime(), name: e.data && e.data.toolName }));
+      const toolResults = evts.filter(e => e.type === "tool_result");
+      const errorCount = toolResults.filter(e => e.data && e.data.isError).length;
+      const meta = evts.find(e => e.provider || e.model) || {};
+      const angle = evts.find(e => e.data && e.data.angle);
+      const ctxEvt = [...evts].reverse().find(e => e.type === "turn_end" && e.data && e.data.contextPercent != null);
+      lanes.push({
+        role, evts, start, end, running,
+        status: failed ? "failed" : running ? "running" : "ended",
+        provider: meta.provider, model: meta.model,
+        title: (angle && angle.data.angle) || role,
+        toolCalls, toolCount: toolCalls.length, errorCount,
+        contextPercent: ctxEvt ? ctxEvt.data.contextPercent : null,
+      });
+    }
+    return lanes.sort((a, b) => a.start - b.start);
+  }
+
+  function renderMiniTimeline(lanes, overallStart, overallSpan) {
+    if (!lanes.length) return "";
+    const rows = lanes.slice(0, 4).map(lane => {
+      const dots = lane.evts.map(e => {
+        const t = new Date(e.ts).getTime();
+        const pct = Math.min(Math.max(((t - overallStart) / overallSpan) * 100, 0), 100);
+        const color = e.type === "tool_result" && e.data && e.data.isError ? "var(--red)"
+          : e.type.includes("end") ? "var(--green)"
+          : e.type === "tool_call" ? "var(--blue)" : "var(--dim)";
+        return \`<span class="mini-dot" style="left:\${pct}%;background:\${color}"></span>\`;
+      }).join("");
+      return \`<div class="mini-tl">\${dots}</div>\`;
+    }).join("");
+    return \`<div class="mini-rows">\${rows}</div>\`;
+  }
+
   function renderSessions() {
     const el = document.getElementById("sessions");
     if (sessions.length === 0) {
-      el.innerHTML = '<div class="empty" style="padding:20px;color:var(--dim)">No sessions yet.<br>Launch with <code>sf claude</code> or <code>sf pi</code>.</div>';
+      el.innerHTML = '<div class="empty">No sessions yet.<br>Launch with <code>sf claude</code> or <code>sf pi</code>.</div>';
       return;
     }
-    el.innerHTML = sessions.map(s => \`
-      <div class="session-item \${s.session_id === selected ? "active" : ""}" data-id="\${s.session_id}">
+    el.innerHTML = sessions.map(s => {
+      const events = eventsCache.get(s.session_id);
+      let mini = "";
+      if (events && events.length) {
+        const lanes = computeLanes(events, s.agent);
+        const t0 = Math.min(...lanes.map(l => l.start));
+        const t1 = Math.max(...lanes.map(l => l.end), Date.now());
+        mini = renderMiniTimeline(lanes, t0, Math.max(t1 - t0, 1000));
+      }
+      return \`
+      <div class="card \${s.session_id === selectedId ? "active" : ""}" data-id="\${s.session_id}">
         <div class="row1">
           <span class="agent \${s.agent}">\${s.kind === "workflow" ? "&#127981; scout-context" : s.agent}</span>
           <span class="badge \${s.status}">\${s.status}</span>
@@ -200,50 +335,142 @@ const PAGE = `<!doctype html>
         \${s.topic ? \`<div class="topic">\${s.topic}</div>\` : ""}
         <div class="meta">\${s.profile || "default"}\${s.model ? " &middot; " + s.model : ""}</div>
         <div class="meta">\${s.tool_count} tool calls &middot; \${timeAgo(s.last_event_at)}</div>
-        \${s.lanes ? \`<div class="lanes">\${s.lanes.map(l => \`<span class="lane-badge \${l.status}">\${l.role.replace("scout-", "")} &middot; \${l.tool_count}</span>\`).join("")}</div>\` : ""}
+        \${mini}
         <div class="idshort">\${s.session_id.slice(0, 12)}</div>
-      </div>\`).join("");
-    el.querySelectorAll(".session-item").forEach(item => {
-      item.addEventListener("click", () => { selected = item.dataset.id; renderSessions(); loadTimeline(); });
+      </div>\`;
+    }).join("");
+    el.querySelectorAll(".card").forEach(item => {
+      item.addEventListener("click", () => {
+        selectedId = item.dataset.id;
+        selectedLane = null;
+        renderSessions();
+        renderDetail();
+      });
     });
   }
 
-  function renderTimeline(events) {
-    const el = document.getElementById("timeline");
-    if (events.length === 0) { el.innerHTML = '<div class="empty">No events yet</div>'; return; }
-    el.innerHTML = events.map(e => {
-      const cls = e.type + (e.data && e.data.isError ? " error" : "");
-      const label = e.data && e.data.toolName ? \`<span class="toolname">\${e.data.toolName}</span>\` : "";
-      const role = e.role ? \`<span class="role-tag">\${e.role}</span>\` : "";
-      return \`<div class="event \${cls}">
-        <div class="line1">
-          <span class="ts">\${new Date(e.ts).toLocaleTimeString()}</span>
-          \${role}
-          <span class="type">\${e.type}</span>
-          \${label}
+  function renderDetail() {
+    const el = document.getElementById("detail");
+    if (!selectedId) { el.innerHTML = '<div class="empty">Select a session</div>'; return; }
+    const session = sessions.find(s => s.session_id === selectedId);
+    const events = eventsCache.get(selectedId) || [];
+    if (!session) { el.innerHTML = '<div class="empty">Session not found</div>'; return; }
+    if (!events.length) { el.innerHTML = '<div class="empty">No events yet</div>'; return; }
+
+    const lanes = computeLanes(events, session.agent);
+    if (!lanes.length) { el.innerHTML = '<div class="empty">No agent activity yet</div>'; return; }
+
+    const t0 = Math.min(...lanes.map(l => l.start));
+    const t1 = Math.max(...lanes.map(l => l.end), Date.now());
+    const span = Math.max(t1 - t0, 1000);
+    const ticks = axisTicks(span, 6);
+    const GLYPH = { ended: "&#10003;", failed: "&#10007;", running: "&#9679;" };
+
+    const axisRow = \`<div class="wf-row axis"><div class="wf-label"></div><div class="wf-track">\${ticks.map((t, i) =>
+      \`<span class="axis-tick \${i === 0 ? "edge" : ""}" style="left:\${t.pct}%">\${t.label}</span>\`).join("")}</div></div>\`;
+
+    const laneRows = lanes.map(lane => {
+      const left = ((lane.start - t0) / span) * 100;
+      const width = Math.max(((lane.end - lane.start) / span) * 100, 3);
+      const color = hashColor(lane.role);
+      const dur = fmtDur(lane.end - lane.start);
+      const toolTicks = lane.toolCalls.map(tc => {
+        const x = Math.min(Math.max(((tc.ts - lane.start) / Math.max(lane.end - lane.start, 1)) * 100, 1), 99);
+        return \`<span class="tool-tick" style="left:\${x}%;color:\${color}"></span>\`;
+      }).join("");
+      const ctxBar = lane.contextPercent != null
+        ? \`<div class="ctx-bar" title="context: \${Math.round(lane.contextPercent)}%"><div class="ctx-fill" style="width:\${Math.max(lane.contextPercent, 2)}%"></div></div>\`
+        : "";
+      return \`
+      <div class="wf-row">
+        <div class="wf-label">
+          <span class="name" style="color:\${color}" title="\${lane.title}">\${lane.role}</span>
+          \${lane.model ? \`<span class="model">\${lane.provider ? lane.provider + "/" : ""}\${lane.model}</span>\` : ""}
+          \${ctxBar}
         </div>
-        \${e.data ? \`<pre>\${JSON.stringify(e.data)}</pre>\` : ""}
+        <div class="wf-track">
+          \${ticks.map(t => \`<span class="gridline" style="left:\${t.pct}%"></span>\`).join("")}
+          <div class="block \${lane.status} \${lane.role === selectedLane ? "selected" : ""}" data-role="\${lane.role}"
+               style="left:\${left}%;width:\${width}%;border-color:\${color};background:linear-gradient(180deg, \${color}33, \${color}11)"
+               title="\${lane.role} - \${lane.status}\${dur ? " - " + dur : ""}">
+            <span class="glyph \${lane.status}">\${GLYPH[lane.status]}</span>
+            <span class="b-name">\${lane.role}</span>
+            <span class="b-dur">\${dur}\${lane.errorCount ? " &middot; " + lane.errorCount + " err" : ""}</span>
+            \${toolTicks}
+          </div>
+        </div>
       </div>\`;
     }).join("");
-    el.scrollTop = el.scrollHeight;
+
+    const laneDetailHtml = selectedLane ? renderLaneDetail(lanes.find(l => l.role === selectedLane)) : "";
+
+    el.innerHTML = \`
+      <div class="run-strip">
+        <span class="topic">\${session.topic || session.profile || session.agent}</span>
+        <span class="badge \${session.status}">\${session.status}</span>
+        <span class="meta">\${session.tool_count} tool calls total</span>
+      </div>
+      <div class="waterfall">\${axisRow}\${laneRows}</div>
+      \${laneDetailHtml}
+    \`;
+
+    el.querySelectorAll(".block").forEach(b => {
+      b.addEventListener("click", () => {
+        selectedLane = selectedLane === b.dataset.role ? null : b.dataset.role;
+        renderDetail();
+      });
+    });
+    const closeBtn = el.querySelector("#lane-detail .close");
+    if (closeBtn) closeBtn.addEventListener("click", () => { selectedLane = null; renderDetail(); });
+  }
+
+  function renderLaneDetail(lane) {
+    if (!lane) return "";
+    const items = lane.evts.filter(e => e.type !== "session_start").map(e => {
+      const isErr = e.data && e.data.isError;
+      const cls = e.type + (isErr ? " err" : "") + (e.data && e.data.ok === false ? " failed" : "");
+      const toolLabel = e.data && e.data.toolName ? \`<span class="ld-tool">\${e.data.toolName}</span>\` : "";
+      let detail = "";
+      if (e.type === "tool_call" && e.data && e.data.args) detail = JSON.stringify(e.data.args);
+      else if (e.type === "gate_result" && e.data && e.data.checks) {
+        detail = e.data.checks.map(c => (c.ok ? "&#10003; " : "&#10007; ") + c.name + ": " + c.detail).join("\\n");
+      } else if (e.data) detail = JSON.stringify(e.data);
+      return \`<div class="ld-event \${cls}">
+        <div class="ld-line1">
+          <span class="ld-ts">\${new Date(e.ts).toLocaleTimeString()}</span>
+          <span class="ld-type">\${e.type}</span>
+          \${toolLabel}
+        </div>
+        \${detail ? \`<pre class="ld-detail-pre">\${detail}</pre>\` : ""}
+      </div>\`;
+    }).join("");
+    return \`<div id="lane-detail">
+      <div class="ld-head">
+        <span class="name">\${lane.role} &middot; \${lane.toolCount} tool call(s)\${lane.errorCount ? " &middot; " + lane.errorCount + " error(s)" : ""}</span>
+        <button class="close">&times;</button>
+      </div>
+      <div class="ld-body">\${items || '<div class="empty">No events</div>'}</div>
+    </div>\`;
   }
 
   async function loadSessions() {
     const res = await fetch("/api/sessions");
     sessions = await res.json();
-    if (!selected && sessions.length > 0) selected = sessions[0].session_id;
-    renderSessions();
-  }
-
-  async function loadTimeline() {
-    if (!selected) return;
-    const res = await fetch("/api/events?session=" + encodeURIComponent(selected));
-    renderTimeline(await res.json());
+    if (!selectedId && sessions.length > 0) selectedId = sessions[0].session_id;
+    // Prefetch events for the most recently active sessions so the list can
+    // draw mini-timelines without a request per hover.
+    const toFetch = sessions.slice(0, 20).map(s => s.session_id);
+    if (selectedId && !toFetch.includes(selectedId)) toFetch.push(selectedId);
+    await Promise.all(toFetch.map(async id => {
+      const r = await fetch("/api/events?session=" + encodeURIComponent(id));
+      eventsCache.set(id, await r.json());
+    }));
   }
 
   async function refresh() {
     await loadSessions();
-    await loadTimeline();
+    renderSessions();
+    renderDetail();
   }
 
   refresh();

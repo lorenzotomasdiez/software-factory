@@ -94,8 +94,14 @@ export default function (pi: ExtensionAPI) {
     emit(sessionId, "tool_result", { toolName: event.toolName, toolCallId: event.toolCallId, isError: event.isError });
   });
 
-  pi.on("turn_end", async (event) => {
-    emit(sessionId, "turn_end", { turnIndex: event.turnIndex });
+  pi.on("turn_end", async (event, ctx) => {
+    const usage = ctx.getContextUsage?.();
+    emit(sessionId, "turn_end", {
+      turnIndex: event.turnIndex,
+      contextTokens: usage?.tokens ?? null,
+      contextWindow: usage?.contextWindow ?? null,
+      contextPercent: usage?.percent ?? null,
+    });
   });
 
   pi.on("session_shutdown", async (event) => {
