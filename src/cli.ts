@@ -55,7 +55,9 @@ Config lives in ${ROOT_DIR}:
   extensions/         reserved for future harness extensions
   hooks/              reserved for future harness hooks
   events/             per-session JSONL event trace, read by \`sf dashboard\`
-  workflows/<id>/report.md   scout-context reports, one per run
+  workflows/scout-context/config.json   models/scouts/reviewer registry
+  workflows/scout-context/prompts/*.md  per-agent prompts (editable)
+  workflows/scout-context/runs/<id>/report.md   one report per run
 
 Examples:
   sf claude

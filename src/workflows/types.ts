@@ -1,8 +1,4 @@
-export interface ScoutEnvelope {
-  summary: string;
-  findings: string[];
-  files: string[];
-}
+import type { ScoutEnvelope } from "./scout-context/gates";
 
 export interface ScoutResult {
   role: string;
