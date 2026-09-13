@@ -270,6 +270,12 @@ const PAGE = `<!doctype html>
     return Math.floor(s / 60) + "m" + Math.round(s % 60) + "s";
   }
 
+  function fmtCost(usd) {
+    if (!usd || usd <= 0) return "$0";
+    if (usd < 0.01) return "<$0.01";
+    return "$" + usd.toFixed(2);
+  }
+
   function axisTicks(spanMs, count) {
     const ticks = [];
     for (let i = 0; i <= count; i++) ticks.push({ pct: (i / count) * 100, label: fmtOffset((spanMs * i) / count) });
@@ -307,12 +313,17 @@ const PAGE = `<!doctype html>
         total: lastGate.data.checks.length,
         allPass: lastGate.data.checks.every(c => c.ok),
       } : null;
+      // sessionCostUsd on a turn_end is already the running total for that
+      // pi process (pi's own per-turn cost.total from its model pricing
+      // tables, accumulated in the extension) - the last one is the lane's spend.
+      const lastTurn = [...evts].reverse().find(e => e.type === "turn_end" && e.data && e.data.sessionCostUsd != null);
+      const costUsd = lastTurn ? lastTurn.data.sessionCostUsd : 0;
       lanes.push({
         role, evts, start, end, running,
         status: failed ? "failed" : running ? "running" : "ended",
         provider: meta.provider, model: meta.model,
         title: (angle && angle.data.angle) || role,
-        toolCalls, toolCount: toolCalls.length, errorCount, gateBadge,
+        toolCalls, toolCount: toolCalls.length, errorCount, gateBadge, costUsd,
         contextPercent: ctxEvt ? ctxEvt.data.contextPercent : null,
       });
     }
@@ -344,11 +355,13 @@ const PAGE = `<!doctype html>
     el.innerHTML = sessions.map(s => {
       const events = eventsCache.get(s.session_id);
       let mini = "";
+      let cost = 0;
       if (events && events.length) {
         const lanes = computeLanes(events, s.agent);
         const t0 = Math.min(...lanes.map(l => l.start));
         const t1 = Math.max(...lanes.map(l => l.end));
         mini = renderMiniTimeline(lanes, t0, Math.max(t1 - t0, 1000));
+        cost = lanes.reduce((sum, l) => sum + (l.costUsd || 0), 0);
       }
       return \`
       <div class="card \${s.session_id === selectedId ? "active" : ""}" data-id="\${s.session_id}">
@@ -358,7 +371,7 @@ const PAGE = `<!doctype html>
         </div>
         \${s.topic ? \`<div class="topic">\${s.topic}</div>\` : ""}
         <div class="meta">\${s.profile || "default"}\${s.model ? " &middot; " + s.model : ""}</div>
-        <div class="meta">\${s.tool_count} tool calls &middot; \${timeAgo(s.last_event_at)}</div>
+        <div class="meta">\${s.tool_count} tool calls &middot; \${fmtCost(cost)} &middot; \${timeAgo(s.last_event_at)}</div>
         \${mini}
         <div class="idshort">\${s.session_id.slice(0, 12)}</div>
       </div>\`;
@@ -410,6 +423,7 @@ const PAGE = `<!doctype html>
         <div class="wf-label">
           <span class="name" style="color:\${color}" title="\${lane.title}">\${lane.role}</span>
           \${lane.model ? \`<span class="model">\${lane.provider ? lane.provider + "/" : ""}\${lane.model}</span>\` : ""}
+          <span class="model" title="spend so far this lane">\${fmtCost(lane.costUsd)}</span>
           \${ctxBar}
         </div>
         <div class="wf-track">
@@ -429,11 +443,13 @@ const PAGE = `<!doctype html>
 
     const laneDetailHtml = selectedLane ? renderLaneDetail(lanes.find(l => l.role === selectedLane)) : "";
 
+    const totalCost = lanes.reduce((sum, l) => sum + (l.costUsd || 0), 0);
     el.innerHTML = \`
       <div class="run-strip">
         <span class="topic">\${session.topic || session.profile || session.agent}</span>
         <span class="badge \${session.status}">\${session.status}</span>
         <span class="meta">\${session.tool_count} tool calls total</span>
+        <span class="meta" title="sum of every lane's real per-turn cost, from pi's own model pricing">&#128176; \${fmtCost(totalCost)} total</span>
       </div>
       <div class="waterfall">\${axisRow}\${laneRows}</div>
       \${laneDetailHtml}

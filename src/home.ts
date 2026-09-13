@@ -73,6 +73,7 @@ function emit(sessionId: string, type: string, data?: unknown) {
 
 export default function (pi: ExtensionAPI) {
   let sessionId = "unknown";
+  let sessionCostUsd = 0;
 
   pi.on("session_start", async (event, ctx) => {
     sessionId = ctx.sessionManager.getSessionId?.() ?? sessionId;
@@ -96,11 +97,19 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("turn_end", async (event, ctx) => {
     const usage = ctx.getContextUsage?.();
+    // pi computes real dollar cost per turn from its own model pricing tables
+    // (message.usage.cost.total) - same source sssf's agent_pi.py reads. Only
+    // an assistant message carries usage; anything else (rare) is skipped.
+    const message = event.message as { role?: string; usage?: { cost?: { total?: number } } } | undefined;
+    const turnCostUsd = message?.role === "assistant" ? (message.usage?.cost?.total ?? 0) : 0;
+    sessionCostUsd += turnCostUsd;
     emit(sessionId, "turn_end", {
       turnIndex: event.turnIndex,
       contextTokens: usage?.tokens ?? null,
       contextWindow: usage?.contextWindow ?? null,
       contextPercent: usage?.percent ?? null,
+      turnCostUsd,
+      sessionCostUsd,
     });
   });
 
@@ -126,12 +135,22 @@ export default function (pi: ExtensionAPI) {
           proc.on("close", (code) => resolve({ report: out, err: errOut, exitCode: code ?? 1 }));
         },
       );
-      if (exitCode !== 0) {
-        ctx.ui.notify(\`scout-context failed: \${err.slice(0, 300)}\`, "error");
+      // A nonzero exit means the workflow's own deterministic gates weren't
+      // fully satisfied (e.g. the reviewer never passed) - it does NOT mean
+      // nothing useful was produced. \`sf workflow scout-context\` always
+      // writes report.md, even a fallback concatenation, so surface whatever
+      // exists rather than throwing away real work because of an exit code.
+      // Only a truly empty report - a crash before anything was written -
+      // is treated as a hard failure with no data.
+      if (!report.trim()) {
+        ctx.ui.notify(\`scout-context failed: \${err.slice(0, 300) || "no report was produced"}\`, "error");
         return;
       }
+      if (exitCode !== 0) {
+        ctx.ui.notify(\`scout-context finished with a warning - see \${process.env.SF_DASHBOARD_URL || "sf dashboard"} for which gate failed. Delivering the report anyway.\`, "warning");
+      }
       pi.sendUserMessage(
-        \`Here is the scout-context report on "\${args}". Use it to answer, don't re-scout unless it's missing something:\\n\\n\${report}\`,
+        \`Here is the scout-context report on "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft and double-check anything surprising)" : ""}. Use it to answer, don't re-scout unless it's missing something:\\n\\n\${report}\`,
         { deliverAs: "followUp" },
       );
     },

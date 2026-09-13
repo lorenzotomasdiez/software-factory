@@ -252,13 +252,28 @@ export async function runScoutContext(topic: string, cwd = process.cwd()): Promi
 
   const review = await runReviewer(cfg, cfg.reviewer, basePrompt, topic, scouts, workflowId, cwd, dashboardUrl);
 
-  const ok = scouts.every((s) => s.ok) && review.ok;
+  // A workflow is "ok" iff the reviewer's own gated output is usable - not iff
+  // every scout individually succeeded. The reviewer prompt already sees
+  // which scouts failed (marked FAILED in scoutReportsText) and synthesizes
+  // around them; a single flaky scout (a tool hiccup, a retry exhausted on
+  // one mechanical check) shouldn't discard a report the reviewer already
+  // demonstrated it could produce and that passed its own deterministic
+  // gates. Zero surviving scouts naturally starves the reviewer of material
+  // and cascades into review.ok=false on its own, so this isn't laundering a
+  // total failure - only refusing to let one straggler veto a good outcome.
+  const failedScouts = scouts.filter((s) => !s.ok);
+  const ok = review.ok;
   const runDir = join(RUNS_DIR, workflowId);
   mkdirSync(runDir, { recursive: true });
   const reportPath = join(runDir, "report.md");
   writeFileSync(reportPath, review.report);
 
-  emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", { ok, reportPath, reviewOk: review.ok });
+  emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", {
+    ok,
+    reportPath,
+    reviewOk: review.ok,
+    failedScouts: failedScouts.map((s) => s.role),
+  });
 
   return { workflowId, ok, topic, scouts, report: review.report, reportPath };
 }
