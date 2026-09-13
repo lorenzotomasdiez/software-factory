@@ -45,8 +45,20 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 const EVENTS_DIR = join(homedir(), ".software-factory", "events");
+const WEB_SEARCH_TIMEOUT_MS = 90_000;
+
+/** Pulls the last fenced json block out of free-form text, if any. */
+function extractJsonBlock(text: string): unknown {
+  const fence = text.match(/\`\`\`(?:json)?\\s*([\\s\\S]*?)\`\`\`/);
+  const candidate = fence ? fence[1] : text;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("no JSON object found");
+  return JSON.parse(candidate.slice(start, end + 1));
+}
 
 function emit(sessionId: string, type: string, data?: unknown) {
   try {
@@ -121,6 +133,61 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async (event) => {
     emit(sessionId, "session_end", { reason: event.reason });
+  });
+
+  // Pi has no built-in web search (only read/bash/edit/write/grep/find/ls),
+  // so a model asked to "search the web" tends to improvise with bash+curl
+  // against whatever endpoint it half-remembers - unreliable and often
+  // network-sandboxed away. Claude Code's own \`-p\` (headless) mode DOES have
+  // a real, provider-native WebSearch tool, so this shells out to it instead
+  // of trying to reimplement search.
+  pi.registerTool({
+    name: "web_search",
+    label: "Web Search",
+    description:
+      "Search the live web for current information (news, recent releases, anything not in your training data). Runs Claude Code's native WebSearch out-of-process and returns a summary with sources.",
+    promptSnippet: "Search the live web for current information",
+    promptGuidelines: [
+      "Use web_search whenever the user asks for current events, news, or anything requiring up-to-date information from the internet - don't try to fetch URLs yourself with bash/curl.",
+    ],
+    parameters: Type.Object({
+      query: Type.String({ description: "What to search for" }),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate) {
+      onUpdate?.({ content: [{ type: "text", text: \`Searching the web for: \${params.query}\` }] });
+      const prompt = [
+        \`Search the live web for: \${params.query}\`,
+        "Use your WebSearch tool - do not answer from memory alone.",
+        "Then output ONLY one fenced json block, nothing before or after it, in this exact shape:",
+        '\`\`\`json\\n{"summary": "...", "sources": [{"title": "...", "url": "..."}]}\\n\`\`\`',
+      ].join("\\n");
+
+      const proc = spawn("claude", ["-p", "--model", "sonnet", prompt], { stdio: ["ignore", "pipe", "pipe"] });
+      const onAbort = () => proc.kill();
+      signal?.addEventListener("abort", onAbort);
+      const timeout = setTimeout(() => proc.kill(), WEB_SEARCH_TIMEOUT_MS);
+
+      let out = "";
+      let errOut = "";
+      proc.stdout.on("data", (chunk) => (out += chunk));
+      proc.stderr.on("data", (chunk) => (errOut += chunk));
+      const exitCode: number = await new Promise((resolve) => proc.on("close", (code) => resolve(code ?? 1)));
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+
+      if (exitCode !== 0 && !out.trim()) {
+        throw new Error(\`web_search: claude -p exited \${exitCode}: \${errOut.trim().slice(-300) || "no output"}\`);
+      }
+
+      try {
+        const parsed = extractJsonBlock(out) as { summary?: string; sources?: unknown[] };
+        return { content: [{ type: "text", text: JSON.stringify(parsed, null, 2) }], details: parsed };
+      } catch {
+        // Claude didn't follow the JSON contract - fall back to its raw
+        // answer rather than failing the whole tool call over formatting.
+        return { content: [{ type: "text", text: out.trim() || "web_search returned no output" }] };
+      }
+    },
   });
 
   pi.registerCommand("scout-context", {
