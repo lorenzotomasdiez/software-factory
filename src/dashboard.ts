@@ -323,7 +323,7 @@ const PAGE = `<!doctype html>
       if (events && events.length) {
         const lanes = computeLanes(events, s.agent);
         const t0 = Math.min(...lanes.map(l => l.start));
-        const t1 = Math.max(...lanes.map(l => l.end), Date.now());
+        const t1 = Math.max(...lanes.map(l => l.end));
         mini = renderMiniTimeline(lanes, t0, Math.max(t1 - t0, 1000));
       }
       return \`
@@ -361,7 +361,7 @@ const PAGE = `<!doctype html>
     if (!lanes.length) { el.innerHTML = '<div class="empty">No agent activity yet</div>'; return; }
 
     const t0 = Math.min(...lanes.map(l => l.start));
-    const t1 = Math.max(...lanes.map(l => l.end), Date.now());
+    const t1 = Math.max(...lanes.map(l => l.end));
     const span = Math.max(t1 - t0, 1000);
     const ticks = axisTicks(span, 6);
     const GLYPH = { ended: "&#10003;", failed: "&#10007;", running: "&#9679;" };
@@ -433,7 +433,8 @@ const PAGE = `<!doctype html>
       let detail = "";
       if (e.type === "tool_call" && e.data && e.data.args) detail = JSON.stringify(e.data.args);
       else if (e.type === "gate_result" && e.data && e.data.checks) {
-        detail = e.data.checks.map(c => (c.ok ? "&#10003; " : "&#10007; ") + c.name + ": " + c.detail).join("\\n");
+        detail = "deterministic checks (attempt " + e.data.attempt + ", no LLM judge):\\n"
+          + e.data.checks.map(c => (c.ok ? "&#10003; " : "&#10007; ") + c.name + ": " + c.detail).join("\\n");
       } else if (e.data) detail = JSON.stringify(e.data);
       return \`<div class="ld-event \${cls}">
         <div class="ld-line1">
@@ -474,6 +475,15 @@ const PAGE = `<!doctype html>
   }
 
   refresh();
+  // Redraw every second so a running agent's block keeps growing toward "now"
+  // even between events (e.g. while it's mid-turn with no tool calls yet) -
+  // the file-watch SSE alone only fires when a new event line is appended.
+  setInterval(() => {
+    if (sessions.some(s => s.status === "running")) {
+      renderSessions();
+      renderDetail();
+    }
+  }, 1000);
   const stream = new EventSource("/api/stream");
   const live = document.getElementById("live");
   stream.onmessage = refresh;
