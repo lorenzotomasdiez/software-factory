@@ -46,6 +46,7 @@ interface SessionSummary {
   session_id: string; // workflow_id when this row is a workflow, else the plain session id
   kind: "session" | "workflow";
   agent: string;
+  workflow_name?: string;
   profile?: string;
   provider?: string;
   model?: string;
@@ -73,6 +74,7 @@ function summarizeSessions(events: SfEvent[]): SessionSummary[] {
     const isWorkflow = Boolean(first.workflow_id);
     let lanes: Lane[] | undefined;
     let topic: string | undefined;
+    let workflowName: string | undefined;
     let status: "running" | "ended" = evts.some((e) => e.type === "session_end" || e.type === "workflow_end")
       ? "ended"
       : "running";
@@ -91,12 +93,15 @@ function summarizeSessions(events: SfEvent[]): SessionSummary[] {
           tool_count: roleEvts.filter((e) => e.type === "tool_call").length,
         }));
       const start = evts.find((e) => e.type === "workflow_start");
-      topic = (start?.data as { topic?: string } | undefined)?.topic;
+      const startData = start?.data as { topic?: string; workflow?: string } | undefined;
+      topic = startData?.topic;
+      workflowName = startData?.workflow;
     }
     summaries.push({
       session_id: key,
       kind: isWorkflow ? "workflow" : "session",
       agent: isWorkflow ? "workflow" : first.agent,
+      workflow_name: workflowName,
       profile: first.profile,
       provider: first.provider,
       model: first.model,
@@ -366,7 +371,7 @@ const PAGE = `<!doctype html>
       return \`
       <div class="card \${s.session_id === selectedId ? "active" : ""}" data-id="\${s.session_id}">
         <div class="row1">
-          <span class="agent \${s.agent}">\${s.kind === "workflow" ? "&#127981; scout-context" : s.agent}</span>
+          <span class="agent \${s.agent}">\${s.kind === "workflow" ? "&#127981; " + (s.workflow_name || "workflow") : s.agent}</span>
           <span class="badge \${s.status}">\${s.status}</span>
         </div>
         \${s.topic ? \`<div class="topic">\${s.topic}</div>\` : ""}

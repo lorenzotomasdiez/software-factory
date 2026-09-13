@@ -4,6 +4,8 @@ import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profi
 import { DEFAULT_DASHBOARD_PORT, ensureDashboardRunning, startDashboard } from "./dashboard";
 import { claudeIsolationArgs, piExtensionArgs, piIsolationArgs } from "./agent-launch";
 import { runScoutContext } from "./workflows/scout-context";
+import { runSpecContext } from "./workflows/spec-context";
+import { startVoiceRuntime } from "./voice-runtime";
 
 const AGENTS = {
   claude: "claude",
@@ -24,6 +26,7 @@ Usage:
   sf profiles
   sf dashboard [--port <n>]
   sf workflow scout-context "<topic>"
+  sf workflow spec-context "<task description>"
   sf --help
 
 Agents:
@@ -39,8 +42,27 @@ Workflows:
                   Traced in the dashboard as one workflow with a lane per
                   scout.
 
+  spec-context    Deterministic multi-agent spec generation: a planner picks
+                  which sections apply (requirements, interfaces, constraints,
+                  acceptance, edge_cases), a different model writes each
+                  section in parallel, and a lead reviewer - on a model that
+                  wrote no section - merges everything into one spec.md +
+                  spec.json, gated by self-consistency checks (every id
+                  survives, every ref resolves). Runs in the background from
+                  inside \`sf pi\` via /spec-context <task>, or standalone via
+                  the CLI above. Traced in the dashboard as one workflow with
+                  a lane per section agent.
+
 Options:
   --profile <name>   Optional add-on profile, appended on top of the base prompt
+                      voice-only adds asynchronous Kokoro TTS for assistant replies
+
+Voice-only setup:
+  SF_KOKORO_URL       Kokoro OpenAI-compatible endpoint (default: http://127.0.0.1:8880/v1/audio/speech)
+  SF_KOKORO_COMMAND   Alternative local command; receives text on stdin and writes audio to stdout
+  SF_AUDIO_PLAYER     Optional player executable override (macOS defaults to afplay)
+  Automatic Kokoro uses localhost port 49637, pinned uv/package/model hashes,
+  and stops its local process when the Pi session exits.
 
 Observability:
   Every \`sf claude\`/\`sf pi\` launch auto-starts a local event dashboard
@@ -52,12 +74,16 @@ Config lives in ${ROOT_DIR}:
   AGENT.md            base system prompt, always applied
   profiles/<name>/AGENT.md   optional add-on, applied with --profile <name>
   config.json         harness config, incl. default --provider/--model per agent
-  extensions/         reserved for future harness extensions
+  extensions/default.ts       observability extension
+  extensions/voice-only.ts    Kokoro TTS extension for the voice-only profile
   hooks/              reserved for future harness hooks
   events/             per-session JSONL event trace, read by \`sf dashboard\`
   workflows/scout-context/config.json   models/scouts/reviewer registry
   workflows/scout-context/prompts/*.md  per-agent prompts (editable)
   workflows/scout-context/runs/<id>/report.md   one report per run
+  workflows/spec-context/config.json    models/planner/sections/reviewer registry
+  workflows/spec-context/prompts/*.md   per-agent prompts (editable)
+  workflows/spec-context/runs/<id>/spec.md, spec.json   one spec per run
 
 Examples:
   sf claude
@@ -157,7 +183,17 @@ async function main(): Promise<void> {
       console.log(result.report);
       process.exit(result.ok ? 0 : 1);
     }
-    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context`);
+    if (name === "spec-context") {
+      const topic = rest.join(" ").trim();
+      if (!topic) {
+        console.error('sf: usage: sf workflow spec-context "<task description>"');
+        process.exit(1);
+      }
+      const result = await runSpecContext(topic);
+      console.log(result.markdown);
+      process.exit(result.ok ? 0 : 1);
+    }
+    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context, spec-context`);
     process.exit(1);
   }
 
@@ -199,7 +235,7 @@ async function main(): Promise<void> {
   // (~/AGENTS.md, ~/CLAUDE.md, globally installed skills/extensions/plugins)
   // so `sf` only brings what software-factory itself configures.
   const isolationArgs = first === "pi" ? piIsolationArgs() : claudeIsolationArgs();
-  const extensionArgs = first === "pi" ? piExtensionArgs() : [];
+  const extensionArgs = first === "pi" ? piExtensionArgs(profile) : [];
 
   const childArgs = systemPrompt
     ? ["--append-system-prompt", systemPrompt, ...isolationArgs, ...defaultArgs, ...extensionArgs, ...passthrough]
@@ -215,11 +251,26 @@ async function main(): Promise<void> {
     if (effectiveModel) env.SF_MODEL = effectiveModel;
   }
 
-  const dashboardUrl = await ensureDashboardRunning();
-  env.SF_DASHBOARD_URL = dashboardUrl;
-  console.log(`🏭 sf observability: ${dashboardUrl}`);
+  let voiceRuntime: Awaited<ReturnType<typeof startVoiceRuntime>>;
 
   try {
+    if (first === "pi" && profile === "voice-only") {
+      try {
+        voiceRuntime = await startVoiceRuntime();
+        if (voiceRuntime) {
+          env.SF_KOKORO_URL = voiceRuntime.url;
+          env.SF_KOKORO_VOICE = process.env.SF_KOKORO_VOICE || "af_heart";
+        }
+      } catch (err) {
+        console.error(`sf: Kokoro could not start. Text interaction will continue without audio.`);
+        console.error(err instanceof Error ? err.message : err);
+      }
+    }
+
+    const dashboardUrl = await ensureDashboardRunning();
+    env.SF_DASHBOARD_URL = dashboardUrl;
+    console.log(`🏭 sf observability: ${dashboardUrl}`);
+
     const proc = Bun.spawn({
       cmd: [binary, ...childArgs],
       stdio: ["inherit", "inherit", "inherit"],
@@ -227,8 +278,10 @@ async function main(): Promise<void> {
       env,
     });
     const exitCode = await proc.exited;
+    await voiceRuntime?.stop();
     process.exit(exitCode);
   } catch (err) {
+    await voiceRuntime?.stop();
     console.error(`sf: failed to launch "${binary}". Is it installed and on PATH?`);
     console.error(err instanceof Error ? err.message : err);
     process.exit(1);

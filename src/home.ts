@@ -8,6 +8,8 @@ export const CONFIG_FILE = join(ROOT_DIR, "config.json");
 export const PROFILES_DIR = join(ROOT_DIR, "profiles");
 export const EXTENSIONS_DIR = join(ROOT_DIR, "extensions");
 export const DEFAULT_EXTENSION_FILE = join(EXTENSIONS_DIR, "default.ts");
+export const VOICE_EXTENSION_FILE = join(EXTENSIONS_DIR, "voice-only.ts");
+export const VOICE_PROFILE_FILE = join(PROFILES_DIR, "voice-only", "AGENT.md");
 export const HOOKS_DIR = join(ROOT_DIR, "hooks");
 export const EVENTS_DIR = join(ROOT_DIR, "events");
 
@@ -71,6 +73,10 @@ function emit(sessionId: string, type: string, data?: unknown) {
   }
 }
 
+function interruptVoicePlayback() {
+  if (process.env.SF_PROFILE === "voice-only") process.emit("sf_voice_interrupt");
+}
+
 export default function (pi: ExtensionAPI) {
   let sessionId = "unknown";
   let sessionCostUsd = 0;
@@ -124,6 +130,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Usage: /scout-context <topic>", "warning");
         return;
       }
+      interruptVoicePlayback();
       ctx.ui.notify(\`Scouting: \${args} (background team launched, see \${process.env.SF_DASHBOARD_URL || "sf dashboard"})\`, "info");
       const { report, err, exitCode } = await new Promise<{ report: string; err: string; exitCode: number }>(
         (resolve) => {
@@ -155,6 +162,313 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+
+  pi.registerCommand("spec-context", {
+    description: "Launch a cross-model agent team to generate a full spec (requirements, interfaces, constraints, acceptance, edge cases) for a task",
+    handler: async (args, ctx) => {
+      if (!args?.trim()) {
+        ctx.ui.notify("Usage: /spec-context <task description>", "warning");
+        return;
+      }
+      interruptVoicePlayback();
+      ctx.ui.notify(\`Generating spec: \${args} (background team launched, see \${process.env.SF_DASHBOARD_URL || "sf dashboard"})\`, "info");
+      const { report, err, exitCode } = await new Promise<{ report: string; err: string; exitCode: number }>(
+        (resolve) => {
+          const proc = spawn("sf", ["workflow", "spec-context", args], { cwd: ctx.cwd });
+          let out = "";
+          let errOut = "";
+          proc.stdout.on("data", (chunk) => (out += chunk));
+          proc.stderr.on("data", (chunk) => (errOut += chunk));
+          proc.on("close", (code) => resolve({ report: out, err: errOut, exitCode: code ?? 1 }));
+        },
+      );
+      // Same reasoning as /scout-context: a nonzero exit means the reviewer's
+      // own gates weren't fully satisfied, not that nothing was produced -
+      // \`sf workflow spec-context\` always writes spec.md/spec.json, even a
+      // fallback concatenation, so surface whatever exists.
+      if (!report.trim()) {
+        ctx.ui.notify(\`spec-context failed: \${err.slice(0, 300) || "no spec was produced"}\`, "error");
+        return;
+      }
+      if (exitCode !== 0) {
+        ctx.ui.notify(\`spec-context finished with a warning - see \${process.env.SF_DASHBOARD_URL || "sf dashboard"} for which gate failed. Delivering the spec anyway.\`, "warning");
+      }
+      pi.sendUserMessage(
+        \`spec-context finished for "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft)" : ""}. It has been saved to spec.md and spec.json under workflows/spec-context/runs/ in the sf home dir. This is raw context for a separate, not-yet-built command to consume later - do NOT start implementing anything from it now. Just confirm it's ready and tell the user where it was saved. For reference, here is the generated spec:\\n\\n\${report}\`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
+}
+`;
+
+const DEFAULT_VOICE_PROFILE = `# Voice-only debate profile
+
+This session is in voice mode. Treat the conversation as a natural spoken dialogue, not as a written report. Respond in English unless the user explicitly asks for another language.
+
+Use short, natural sentences with clear punctuation and conversational rhythm. Prefer contractions and ordinary words. Keep responses concise enough to listen to comfortably. Ask focused follow-up questions when needed, challenge assumptions respectfully, and preserve the useful context of the debate.
+
+Do not use markdown tables, code fences, long enumerations, raw URLs, file paths, or dense formatting unless the user explicitly asks for them. Do not narrate internal reasoning, tool calls, system behavior, TTS, audio playback, or voice-mode limitations. Do not tell the user that a request should not be handled in voice mode. Perform the task normally and silently, then explain the result in spoken-friendly language.
+
+The user may provide text through terminal input or OS dictation, and dictation may contain transcription mistakes. Infer the intended meaning from context and ask only when the ambiguity matters. When the user asks for a requirement, specification, or artifact, use the full debate history and the requested workflow or command. Switch to detailed written output only when the user explicitly requests it.
+`;
+
+const DEFAULT_VOICE_EXTENSION = `// software-factory voice-only profile extension.
+// Kokoro is intentionally external so the compiled sf binary stays portable.
+// Configure SF_KOKORO_URL or SF_KOKORO_COMMAND before launching sf.
+
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+type Child = ReturnType<typeof spawn>;
+type VoiceContext = { ui: { notify(message: string, level: "info" | "warning" | "error"): void } };
+
+const PROFILE = "voice-only";
+const DEFAULT_KOKORO_URL = "http://127.0.0.1:8880/v1/audio/speech";
+let queue: string[] = [];
+let draining = false;
+let generation = 0;
+let synthesisAbort: AbortController | undefined;
+let synthesisProcess: Child | undefined;
+let playbackProcess: Child | undefined;
+
+function isVoiceProfile(): boolean {
+  return process.env.SF_PROFILE === PROFILE;
+}
+
+function killProcess(child: Child | undefined): void {
+  if (!child || child.exitCode !== null || child.killed) return;
+  try {
+    child.kill("SIGTERM");
+  } catch {
+    // The process may have exited between the check and kill.
+  }
+}
+
+function stopAudio(): void {
+  generation++;
+  queue = [];
+  synthesisAbort?.abort();
+  killProcess(synthesisProcess);
+  killProcess(playbackProcess);
+}
+
+function speechText(message: unknown): string | undefined {
+  const value = message as {
+    role?: string;
+    stopReason?: string;
+    content?: unknown;
+  };
+  if (value.role !== "assistant" || value.stopReason === "toolUse") return undefined;
+
+  const blocks = Array.isArray(value.content) ? value.content : [{ type: "text", text: value.content }];
+  if (blocks.some((block) => {
+    const item = block as { type?: string };
+    return item.type === "toolCall" || item.type === "tool_use" || item.type === "functionCall";
+  })) return undefined;
+
+  const text = blocks
+    .filter((block) => (block as { type?: string }).type === "text")
+    .map((block) => String((block as { text?: unknown }).text ?? ""))
+    .join("\\n")
+    .trim();
+  if (!text) return undefined;
+
+  return text
+    .replace(/\`\`\`[\\s\\S]*?\`\`\`/g, " ")
+    .replace(/!\\[([^\\]]*)\\]\\([^)]*\\)/g, "$1")
+    .replace(/\\[([^\\]]+)\\]\\([^)]*\\)/g, "$1")
+    .replace(/[#*_~\`]/g, "")
+    .replace(/^\\s*[-*>]\\s+/gm, "")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+
+function audioPath(): string {
+  return join(tmpdir(), "sf-kokoro-" + randomUUID() + ".wav");
+}
+
+async function synthesizeWithHttp(text: string, file: string, signal: AbortSignal): Promise<void> {
+  const response = await fetch(process.env.SF_KOKORO_URL || DEFAULT_KOKORO_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: process.env.SF_KOKORO_MODEL || "kokoro",
+      voice: process.env.SF_KOKORO_VOICE || "af_heart",
+      input: text,
+      response_format: "wav",
+      speed: Number(process.env.SF_KOKORO_SPEED || "1"),
+    }),
+    signal,
+  });
+  if (!response.ok) throw new Error("Kokoro HTTP " + response.status + " " + (await response.text()).slice(0, 200));
+  writeFileSync(file, Buffer.from(await response.arrayBuffer()));
+}
+
+async function synthesizeWithCommand(text: string, file: string, signal: AbortSignal): Promise<void> {
+  const command = process.env.SF_KOKORO_COMMAND;
+  if (!command) throw new Error("Kokoro is not configured. Set SF_KOKORO_URL or SF_KOKORO_COMMAND.");
+
+  const child = spawn("sh", ["-c", command], { stdio: ["pipe", "pipe", "pipe"] });
+  synthesisProcess = child;
+  const output: Buffer[] = [];
+  let errorOutput = "";
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => {
+      killProcess(child);
+      finish(new Error("voice synthesis cancelled"));
+    };
+    child.stdout?.on("data", (chunk) => output.push(Buffer.from(chunk)));
+    child.stderr?.on("data", (chunk) => { errorOutput += String(chunk); });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code) => {
+      if (signal.aborted) return finish(new Error("voice synthesis cancelled"));
+      if (code !== 0) return finish(new Error(errorOutput.trim() || "Kokoro command exited " + code));
+      if (!output.length) return finish(new Error("Kokoro command produced no audio"));
+      writeFileSync(file, Buffer.concat(output));
+      finish();
+    });
+    signal.addEventListener("abort", abort, { once: true });
+    try {
+      child.stdin?.write(text);
+      child.stdin?.end();
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+  if (synthesisProcess === child) synthesisProcess = undefined;
+}
+
+async function synthesize(text: string, file: string, signal: AbortSignal): Promise<void> {
+  if (process.env.SF_KOKORO_COMMAND) return synthesizeWithCommand(text, file, signal);
+  return synthesizeWithHttp(text, file, signal);
+}
+
+function playerCommand(file: string): [string, string[]] {
+  const player = process.env.SF_AUDIO_PLAYER || (process.platform === "darwin" ? "afplay" : process.platform === "linux" ? "ffplay" : "");
+  if (!player) throw new Error("No audio player configured. Set SF_AUDIO_PLAYER.");
+  if (process.env.SF_AUDIO_PLAYER) return [player, [file]];
+  return process.platform === "darwin"
+    ? [player, [file]]
+    : [player, ["-nodisp", "-autoexit", "-loglevel", "quiet", file]];
+}
+
+async function play(file: string, signal: AbortSignal): Promise<void> {
+  const [command, args] = playerCommand(file);
+  const child = spawn(command, args, { stdio: ["ignore", "ignore", "pipe"] });
+  playbackProcess = child;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = () => {
+      killProcess(child);
+      finish(new Error("voice playback cancelled"));
+    };
+    let errorOutput = "";
+    child.stderr?.on("data", (chunk) => { errorOutput += String(chunk); });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code) => {
+      if (signal.aborted) return finish(new Error("voice playback cancelled"));
+      if (code !== 0) return finish(new Error(errorOutput.trim() || "audio player exited " + code));
+      finish();
+    });
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  if (playbackProcess === child) playbackProcess = undefined;
+}
+
+function reportFailure(ctx: VoiceContext, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error("[sf voice] " + message);
+  try {
+    ctx.ui.notify("Voice output unavailable: " + message, "error");
+  } catch {
+    // Text interaction must continue even when the UI is already shutting down.
+  }
+}
+
+async function drain(ctx: VoiceContext): Promise<void> {
+  if (draining) return;
+  draining = true;
+  try {
+    while (queue.length) {
+      const itemGeneration = generation;
+      const text = queue.shift()!;
+      const file = audioPath();
+      const controller = new AbortController();
+      synthesisAbort = controller;
+      try {
+        await synthesize(text, file, controller.signal);
+        if (itemGeneration !== generation) continue;
+        await play(file, controller.signal);
+      } catch (error) {
+        if (itemGeneration === generation && !controller.signal.aborted) reportFailure(ctx, error);
+      } finally {
+        if (synthesisAbort === controller) synthesisAbort = undefined;
+        try { unlinkSync(file); } catch { /* file was not created */ }
+      }
+    }
+  } finally {
+    draining = false;
+  }
+}
+
+export default function (pi: ExtensionAPI) {
+  const onVoiceInterrupt = () => stopAudio();
+
+  pi.on("session_start", () => {
+    process.on("sf_voice_interrupt", onVoiceInterrupt);
+  });
+
+  pi.on("message_end", (event, ctx) => {
+    if (!isVoiceProfile()) return;
+    const text = speechText(event.message);
+    if (!text) return;
+    queue.push(text);
+    void drain(ctx);
+  });
+
+  pi.on("input", (event) => {
+    if (!isVoiceProfile() || event.source === "extension") return;
+    stopAudio();
+    if (/^\\/(stop|cancel)(\\s|$)/i.test(event.text)) return;
+  });
+
+  pi.on("tool_execution_start", () => {
+    if (isVoiceProfile()) stopAudio();
+  });
+
+  pi.on("session_shutdown", () => {
+    if (isVoiceProfile()) stopAudio();
+    process.off("sf_voice_interrupt", onVoiceInterrupt);
+  });
+
+  pi.registerCommand("voice-stop", {
+    description: "Stop Kokoro voice playback and clear queued speech",
+    handler: async (_args, ctx) => {
+      if (!isVoiceProfile()) return;
+      stopAudio();
+      ctx.ui.notify("Voice playback stopped.", "info");
+    },
+  });
 }
 `;
 
@@ -169,6 +483,7 @@ export function ensureHome(): void {
   mkdirSync(ROOT_DIR, { recursive: true });
   mkdirSync(PROFILES_DIR, { recursive: true });
   mkdirSync(EXTENSIONS_DIR, { recursive: true });
+  mkdirSync(join(PROFILES_DIR, "voice-only"), { recursive: true });
   mkdirSync(HOOKS_DIR, { recursive: true });
   mkdirSync(EVENTS_DIR, { recursive: true });
 
@@ -180,6 +495,12 @@ export function ensureHome(): void {
   }
   if (!existsSync(DEFAULT_EXTENSION_FILE)) {
     writeFileSync(DEFAULT_EXTENSION_FILE, DEFAULT_EXTENSION);
+  }
+  if (!existsSync(VOICE_EXTENSION_FILE)) {
+    writeFileSync(VOICE_EXTENSION_FILE, DEFAULT_VOICE_EXTENSION);
+  }
+  if (!existsSync(VOICE_PROFILE_FILE)) {
+    writeFileSync(VOICE_PROFILE_FILE, DEFAULT_VOICE_PROFILE);
   }
 }
 

@@ -244,7 +244,11 @@ export async function runScoutContext(topic: string, cwd = process.cwd()): Promi
   const basePrompt = readBaseAgentPrompt();
   const dashboardUrl = await ensureDashboardRunning();
 
-  emitWorkflowEvent(workflowId, "orchestrator", "workflow_start", { topic, agents: cfg.scouts.length + 1 });
+  emitWorkflowEvent(workflowId, "orchestrator", "workflow_start", {
+    topic,
+    agents: cfg.scouts.length + 1,
+    workflow: "scout-context",
+  });
 
   const scouts = await Promise.all(
     cfg.scouts.map((spec) => runScout(cfg, basePrompt, spec, topic, workflowId, cwd, dashboardUrl)),
