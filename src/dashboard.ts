@@ -184,6 +184,9 @@ const PAGE = `<!doctype html>
   .glyph.running { color: var(--blue); }
   .b-name { font-weight: 700; overflow: hidden; text-overflow: ellipsis; }
   .b-dur { margin-left: auto; color: var(--dim); font-size: 10px; flex: none; }
+  .b-gate { flex: none; font-size: 10px; padding: 0 4px; border-radius: 3px; border: 1px solid; }
+  .b-gate.pass { color: var(--green); border-color: var(--green); }
+  .b-gate.fail { color: var(--red); border-color: var(--red); }
   .tool-tick { position: absolute; bottom: 3px; width: 2px; height: 7px; background: currentColor; opacity: 0.6; border-radius: 1px; }
   .tool-tick.err { background: var(--red); opacity: 1; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
@@ -194,19 +197,34 @@ const PAGE = `<!doctype html>
   #lane-detail .ld-head .name { font-weight: 700; font-size: 13px; }
   #lane-detail .ld-head .close { cursor: pointer; color: var(--dim); font-size: 16px; background: none; border: none; }
   #lane-detail .ld-head .close:hover { color: var(--text); }
-  #lane-detail .ld-body { max-height: 340px; overflow-y: auto; padding: 8px 14px; }
+  #lane-detail .ld-body { max-height: 420px; overflow-y: auto; padding: 8px 14px; }
   .ld-event { border-left: 3px solid #333; padding: 5px 10px; margin-bottom: 5px; border-radius: 0 4px 4px 0; background: var(--panel2); font-size: 11.5px; }
   .ld-event.tool_call { border-color: var(--blue); }
   .ld-event.tool_result { border-color: var(--orange); }
   .ld-event.tool_result.err { border-color: var(--red); }
   .ld-event.scout_end, .ld-event.session_end { border-color: var(--green); }
   .ld-event.scout_end.failed { border-color: var(--red); }
-  .ld-event.gate_result { border-color: var(--accent); }
   .ld-event .ld-line1 { display: flex; gap: 8px; align-items: baseline; }
   .ld-ts { color: var(--dim); font-size: 10px; }
   .ld-type { font-weight: 700; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.3px; }
   .ld-tool { color: var(--accent); font-weight: 600; }
   .ld-detail-pre { white-space: pre-wrap; word-break: break-all; margin: 4px 0 0; color: var(--dim); font-size: 11px; }
+  .ld-section-h { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--dim); margin: 10px 0 6px; display: flex; align-items: center; gap: 6px; }
+  .ld-section-h:first-child { margin-top: 0; }
+  .gate-block { border: 1px solid var(--border-soft); border-left: 3px solid; border-radius: 0 6px 6px 0; margin-bottom: 8px; background: var(--panel2); overflow: hidden; }
+  .gate-block.pass { border-left-color: var(--green); }
+  .gate-block.fail { border-left-color: var(--red); }
+  .gate-block-head { padding: 6px 10px; display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; }
+  .gate-block-head .gm { font-weight: 700; }
+  .gate-block-head .gm.pass { color: var(--green); }
+  .gate-block-head .gm.fail { color: var(--red); }
+  .gate-block-head .gsummary { color: var(--dim); margin-left: auto; font-size: 10.5px; }
+  .gate-check-row { display: flex; gap: 8px; padding: 3px 10px 3px 22px; font-size: 11px; align-items: baseline; }
+  .gate-check-row .cm { flex: none; }
+  .gate-check-row.pass .cm { color: var(--green); }
+  .gate-check-row.fail .cm { color: var(--red); }
+  .gate-check-row .cname { font-weight: 600; flex: none; }
+  .gate-check-row .cdetail { color: var(--dim); overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -283,12 +301,18 @@ const PAGE = `<!doctype html>
       const meta = evts.find(e => e.provider || e.model) || {};
       const angle = evts.find(e => e.data && e.data.angle);
       const ctxEvt = [...evts].reverse().find(e => e.type === "turn_end" && e.data && e.data.contextPercent != null);
+      const lastGate = [...evts].reverse().find(e => e.type === "gate_result" && e.data && e.data.checks);
+      const gateBadge = lastGate ? {
+        passed: lastGate.data.checks.filter(c => c.ok).length,
+        total: lastGate.data.checks.length,
+        allPass: lastGate.data.checks.every(c => c.ok),
+      } : null;
       lanes.push({
         role, evts, start, end, running,
         status: failed ? "failed" : running ? "running" : "ended",
         provider: meta.provider, model: meta.model,
         title: (angle && angle.data.angle) || role,
-        toolCalls, toolCount: toolCalls.length, errorCount,
+        toolCalls, toolCount: toolCalls.length, errorCount, gateBadge,
         contextPercent: ctxEvt ? ctxEvt.data.contextPercent : null,
       });
     }
@@ -395,6 +419,7 @@ const PAGE = `<!doctype html>
                title="\${lane.role} - \${lane.status}\${dur ? " - " + dur : ""}">
             <span class="glyph \${lane.status}">\${GLYPH[lane.status]}</span>
             <span class="b-name">\${lane.role}</span>
+            \${lane.gateBadge ? \`<span class="b-gate \${lane.gateBadge.allPass ? "pass" : "fail"}" title="deterministic gates: \${lane.gateBadge.passed}/\${lane.gateBadge.total} checks passed">&#128737; \${lane.gateBadge.passed}/\${lane.gateBadge.total}</span>\` : ""}
             <span class="b-dur">\${dur}\${lane.errorCount ? " &middot; " + lane.errorCount + " err" : ""}</span>
             \${toolTicks}
           </div>
@@ -424,18 +449,46 @@ const PAGE = `<!doctype html>
     if (closeBtn) closeBtn.addEventListener("click", () => { selectedLane = null; renderDetail(); });
   }
 
+  /** Dedicated rollup of this lane's gate_result events (one per validation
+   *  attempt), split out from the raw event stream so pass/fail per
+   *  deterministic check is immediately legible - mirrors sssf's PhaseDetail
+   *  "gates" panel, which never mixes gate verdicts into the plain event log. */
+  function renderGatesSection(gateEvents) {
+    if (!gateEvents.length) return "";
+    const blocks = gateEvents.map(e => {
+      const checks = (e.data && e.data.checks) || [];
+      const failed = checks.filter(c => !c.ok).length;
+      const passed = failed === 0;
+      const rows = checks.map(c => \`
+        <div class="gate-check-row \${c.ok ? "pass" : "fail"}">
+          <span class="cm">\${c.ok ? "&#10003;" : "&#10007;"}</span>
+          <span class="cname">\${c.name}</span>
+          <span class="cdetail">\${c.detail}</span>
+        </div>\`).join("");
+      return \`
+      <div class="gate-block \${passed ? "pass" : "fail"}">
+        <div class="gate-block-head">
+          <span class="gm \${passed ? "pass" : "fail"}">\${passed ? "&#10003;" : "&#10007;"}</span>
+          <span>attempt \${e.data && e.data.attempt != null ? e.data.attempt : "?"}</span>
+          <span class="gsummary">\${passed ? \`\${checks.length}/\${checks.length} passed\` : \`\${failed} of \${checks.length} failed\`} &middot; \${new Date(e.ts).toLocaleTimeString()}</span>
+        </div>
+        \${rows}
+      </div>\`;
+    }).join("");
+    return \`<div class="ld-section-h">&#128737; deterministic gates (no LLM judge) &middot; \${gateEvents.length} attempt(s)</div>\${blocks}\`;
+  }
+
   function renderLaneDetail(lane) {
     if (!lane) return "";
-    const items = lane.evts.filter(e => e.type !== "session_start").map(e => {
+    const gateEvents = lane.evts.filter(e => e.type === "gate_result");
+    const otherEvents = lane.evts.filter(e => e.type !== "session_start" && e.type !== "gate_result");
+    const items = otherEvents.map(e => {
       const isErr = e.data && e.data.isError;
       const cls = e.type + (isErr ? " err" : "") + (e.data && e.data.ok === false ? " failed" : "");
       const toolLabel = e.data && e.data.toolName ? \`<span class="ld-tool">\${e.data.toolName}</span>\` : "";
       let detail = "";
       if (e.type === "tool_call" && e.data && e.data.args) detail = JSON.stringify(e.data.args);
-      else if (e.type === "gate_result" && e.data && e.data.checks) {
-        detail = "deterministic checks (attempt " + e.data.attempt + ", no LLM judge):\\n"
-          + e.data.checks.map(c => (c.ok ? "&#10003; " : "&#10007; ") + c.name + ": " + c.detail).join("\\n");
-      } else if (e.data) detail = JSON.stringify(e.data);
+      else if (e.data) detail = JSON.stringify(e.data);
       return \`<div class="ld-event \${cls}">
         <div class="ld-line1">
           <span class="ld-ts">\${new Date(e.ts).toLocaleTimeString()}</span>
@@ -450,7 +503,11 @@ const PAGE = `<!doctype html>
         <span class="name">\${lane.role} &middot; \${lane.toolCount} tool call(s)\${lane.errorCount ? " &middot; " + lane.errorCount + " error(s)" : ""}</span>
         <button class="close">&times;</button>
       </div>
-      <div class="ld-body">\${items || '<div class="empty">No events</div>'}</div>
+      <div class="ld-body">
+        \${renderGatesSection(gateEvents)}
+        <div class="ld-section-h">&#128337; events (\${otherEvents.length})</div>
+        \${items || '<div class="empty">No events</div>'}
+      </div>
     </div>\`;
   }
 

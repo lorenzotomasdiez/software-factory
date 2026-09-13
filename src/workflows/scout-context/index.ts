@@ -182,8 +182,8 @@ async function runReviewer(
   const systemPrompt = [basePrompt, instructionBody].filter(Boolean).join("\n\n");
   const { provider, model } = resolveModel(cfg, spec.modelKey);
   const sessionId = `sf-review-${workflowId}`;
-  const scoutTitles = scouts.map((s) => s.angle);
   const scoutTexts = scouts.filter((s) => s.ok && s.envelope).map((s) => JSON.stringify(s.envelope));
+  const scoutsForGate = scouts.filter((s) => s.ok && s.envelope).map((s) => ({ angle: s.angle, files: s.envelope!.files }));
 
   // Reuses the scout event-type names (scout_start/scout_retry/scout_end) so
   // the dashboard's existing per-role lane grouping picks the reviewer up as
@@ -213,7 +213,7 @@ async function runReviewer(
     }
 
     const report = result.stdout.trim();
-    const checks = reviewerGates(report, scoutTitles, scoutTexts);
+    const checks = reviewerGates(report, scoutTexts, scoutsForGate);
     const failed = checks.filter((c) => !c.ok);
     emitWorkflowEvent(workflowId, spec.role, "gate_result", { attempt, checks });
     if (failed.length === 0) {

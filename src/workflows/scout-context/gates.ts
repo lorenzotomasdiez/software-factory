@@ -65,7 +65,40 @@ export function scoutGates(raw: unknown, cwd: string): GateCheck[] {
     detail: missing.length === 0 ? `all ${envelope.files.length} file(s) exist` : `does not exist: ${missing.join(", ")}`,
   });
 
+  const undeclared = findingsPathMismatch(envelope.findings, envelope.files);
+  checks.push({
+    name: "findings_consistent",
+    ok: undeclared.length === 0,
+    detail:
+      undeclared.length === 0
+        ? "every file path mentioned in findings is listed in files[]"
+        : `findings mention path(s) missing from files[]: ${undeclared.join(", ")}`,
+  });
+
   return checks;
+}
+
+/** Path-looking tokens: a slash-or-dot-separated segment ending in a short extension. */
+const PATH_TOKEN = /\b[\w][\w./-]*\.[a-zA-Z]{1,10}\b/g;
+
+function extractPathTokens(text: string): string[] {
+  return [...text.matchAll(PATH_TOKEN)].map((m) => m[0]);
+}
+
+/**
+ * Self-consistency check (mirrors sssf's `verdict_consistent`): does the
+ * envelope contradict itself, not "is it right." A scout that writes
+ * "src/foo/bar.ts does X" in its findings but never lists bar.ts under
+ * files[] is making an unbacked claim the harness can catch without
+ * reading a line of the file.
+ */
+function findingsPathMismatch(findings: string[], files: string[]): string[] {
+  const declared = new Set(files.map((f) => f.toLowerCase()));
+  const mentioned = new Set<string>();
+  for (const finding of findings) {
+    for (const token of extractPathTokens(finding)) mentioned.add(token.toLowerCase());
+  }
+  return [...mentioned].filter((token) => !declared.has(token) && ![...declared].some((f) => f.endsWith(token) || token.endsWith(f)));
 }
 
 function words(text: string): Set<string> {
@@ -82,23 +115,43 @@ function jaccardSimilarity(a: string, b: string): number {
   return union === 0 ? 0 : intersection / union;
 }
 
+export interface ScoutForGate {
+  angle: string;
+  files: string[];
+}
+
 /**
  * Deterministic checks on the reviewer's synthesized report: long enough,
- * references more than one scout by title, and isn't just a near-duplicate
- * of a single scout's raw output (word-overlap heuristic, not an LLM judge).
+ * actually draws on more than one scout's own file citations (not just
+ * whichever scout happens to share the most vocabulary with the topic),
+ * isn't just a near-duplicate of a single scout's raw output (word-overlap
+ * heuristic, not an LLM judge), and doesn't invent file paths no scout
+ * actually reported (self-consistency against the source material it was
+ * given, same idea as sssf's `verdict_consistent`).
+ *
+ * `cites_scouts` checks concrete file paths rather than title text: the
+ * reviewer is never instructed to reuse a scout's exact heading, so matching
+ * on paraphrase-able prose was a false-positive machine. A file path is a
+ * claim it either backs or doesn't.
  */
-export function reviewerGates(report: string, scoutTitles: string[], scoutTexts: string[]): GateCheck[] {
+export function reviewerGates(report: string, scoutTexts: string[], scouts: ScoutForGate[]): GateCheck[] {
   const checks: GateCheck[] = [];
   const trimmed = report.trim();
+  const reportPaths = new Set(extractPathTokens(trimmed).map((p) => p.toLowerCase()));
 
   checks.push({ name: "min_length", ok: trimmed.length >= 300, detail: `${trimmed.length} chars` });
 
-  const lower = trimmed.toLowerCase();
-  const cited = scoutTitles.filter((t) => lower.includes(t.toLowerCase()));
+  // Only scouts that actually declared a file can be "cited" this way - a
+  // scout with an empty files[] isn't a gap in the reviewer's work.
+  const citable = scouts.filter((s) => s.files.length > 0);
+  const covered = citable.filter((s) => s.files.some((f) => reportPaths.has(f.toLowerCase())));
   checks.push({
     name: "cites_scouts",
-    ok: cited.length >= Math.max(1, Math.ceil(scoutTitles.length / 2)),
-    detail: `references ${cited.length}/${scoutTitles.length} scout titles`,
+    ok: citable.length === 0 || covered.length >= Math.max(1, Math.ceil(citable.length / 2)),
+    detail:
+      citable.length === 0
+        ? "no scout declared a citable file - skipped"
+        : `cites a file from ${covered.length}/${citable.length} scout(s) with files: ${covered.map((s) => s.angle).join(", ") || "none"}`,
   });
 
   const maxSimilarity = Math.max(0, ...scoutTexts.map((t) => jaccardSimilarity(trimmed, t)));
@@ -106,6 +159,17 @@ export function reviewerGates(report: string, scoutTitles: string[], scoutTexts:
     name: "not_verbatim_copy",
     ok: maxSimilarity < 0.75,
     detail: `max word-overlap with a single scout: ${(maxSimilarity * 100).toFixed(0)}%`,
+  });
+
+  const allFiles = scouts.flatMap((s) => s.files);
+  const invented = findingsPathMismatch([trimmed], allFiles);
+  checks.push({
+    name: "no_invented_files",
+    ok: invented.length === 0,
+    detail:
+      invented.length === 0
+        ? "every file path in the report traces back to a scout"
+        : `report mentions path(s) no scout reported: ${invented.join(", ")}`,
   });
 
   return checks;
