@@ -388,6 +388,14 @@ const PAGE = `<!doctype html>
 
   function renderDetail() {
     const el = document.getElementById("detail");
+    // Every refresh (file-watch SSE fires on every appended event - constant
+    // while a workflow is mid-run - plus the 1s live tick) fully rebuilds this
+    // panel's innerHTML, which silently resets scroll to 0. Capture both
+    // scrollable regions' positions here and restore them after the rebuild
+    // below, or a click into a lane's history could never actually be read.
+    const prevDetailScroll = el.scrollTop;
+    const prevLdBody = el.querySelector(".ld-body");
+    const prevLdScroll = prevLdBody ? prevLdBody.scrollTop : null;
     if (!selectedId) { el.innerHTML = '<div class="empty">Select a session</div>'; return; }
     const session = sessions.find(s => s.session_id === selectedId);
     const events = eventsCache.get(selectedId) || [];
@@ -454,6 +462,10 @@ const PAGE = `<!doctype html>
       <div class="waterfall">\${axisRow}\${laneRows}</div>
       \${laneDetailHtml}
     \`;
+
+    el.scrollTop = prevDetailScroll;
+    const newLdBody = el.querySelector(".ld-body");
+    if (newLdBody && prevLdScroll != null) newLdBody.scrollTop = prevLdScroll;
 
     el.querySelectorAll(".block").forEach(b => {
       b.addEventListener("click", () => {
