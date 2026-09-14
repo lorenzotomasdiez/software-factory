@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, watch } from "node:fs";
 import { join } from "node:path";
 import { EVENTS_DIR } from "./home";
+import { isWorkflowAlive, requestCancel } from "./workflows/cancel";
 
 export const DEFAULT_DASHBOARD_PORT = 4317;
 
@@ -75,9 +76,16 @@ function summarizeSessions(events: SfEvent[]): SessionSummary[] {
     let lanes: Lane[] | undefined;
     let topic: string | undefined;
     let workflowName: string | undefined;
-    let status: "running" | "ended" = evts.some((e) => e.type === "session_end" || e.type === "workflow_end")
-      ? "ended"
-      : "running";
+    // A workflow spawns many pi sub-sessions, each emitting its own
+    // session_end (including on every retry), so only workflow_end - or the
+    // orchestrator process no longer existing - means the workflow is over.
+    let status: "running" | "ended" = isWorkflow
+      ? evts.some((e) => e.type === "workflow_end") || !isWorkflowAlive(key)
+        ? "ended"
+        : "running"
+      : evts.some((e) => e.type === "session_end")
+        ? "ended"
+        : "running";
     if (isWorkflow) {
       const byRole = new Map<string, SfEvent[]>();
       for (const e of evts) {
@@ -155,6 +163,10 @@ const PAGE = `<!doctype html>
   .badge.running { color: var(--blue); border-color: var(--blue); }
   .badge.ended { color: var(--green); border-color: var(--green); }
   .badge.failed { color: var(--red); border-color: var(--red); }
+  .copy-btn { margin-left: auto; font-size: 11px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--dim); cursor: pointer; font-family: inherit; }
+  .copy-btn:hover { color: var(--text); border-color: var(--text); }
+  .cancel-btn { color: var(--red); border-color: var(--red); }
+  .cancel-btn:hover { color: #fff; background: var(--red); }
   .card .meta { color: var(--dim); font-size: 11px; margin-top: 3px; }
   .card .idshort { color: var(--faint); font-size: 10px; margin-top: 2px; }
   .mini-tl { position: relative; height: 6px; margin-top: 6px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
@@ -290,7 +302,7 @@ const PAGE = `<!doctype html>
   /** Groups a session/workflow's raw events into one lane per agent role, with
    *  real start/end timestamps so the waterfall can position blocks by actual
    *  elapsed time instead of arrival order. */
-  function computeLanes(events, fallbackAgent) {
+  function computeLanes(events, fallbackAgent, sessionStatus) {
     const byRole = new Map();
     for (const e of events) {
       const role = e.role && e.role !== "orchestrator" ? e.role : (e.workflow_id ? null : (fallbackAgent || "agent"));
@@ -302,10 +314,19 @@ const PAGE = `<!doctype html>
     for (const [role, evts] of byRole) {
       evts.sort((a, b) => new Date(a.ts) - new Date(b.ts));
       const start = new Date(evts[0].ts).getTime();
-      const endEvt = evts.find(e => e.type === "session_end" || e.type === "scout_end");
+      // Inside a workflow a role's pi process can end and restart several
+      // times (retries, developer/tester cycles) - only scout_end closes the
+      // lane. A plain session has no scout events, so session_end does.
+      const isWorkflowLane = evts.some(e => e.workflow_id);
+      const endEvt = isWorkflowLane
+        ? [...evts].reverse().find(e => e.type === "scout_end")
+        : evts.find(e => e.type === "session_end");
       const failed = Boolean(endEvt && endEvt.data && endEvt.data.ok === false);
-      const running = !endEvt;
-      const end = endEvt ? new Date(endEvt.ts).getTime() : Date.now();
+      // A lane still open when the whole workflow is over was abandoned
+      // (orchestrator killed/crashed): stop growing it at its last event.
+      const abandoned = !endEvt && sessionStatus === "ended";
+      const running = !endEvt && !abandoned;
+      const end = endEvt ? new Date(endEvt.ts).getTime() : abandoned ? new Date(evts[evts.length - 1].ts).getTime() : Date.now();
       const toolCalls = evts.filter(e => e.type === "tool_call").map(e => ({ ts: new Date(e.ts).getTime(), name: e.data && e.data.toolName }));
       const toolResults = evts.filter(e => e.type === "tool_result");
       const errorCount = toolResults.filter(e => e.data && e.data.isError).length;
@@ -325,7 +346,7 @@ const PAGE = `<!doctype html>
       const costUsd = lastTurn ? lastTurn.data.sessionCostUsd : 0;
       lanes.push({
         role, evts, start, end, running,
-        status: failed ? "failed" : running ? "running" : "ended",
+        status: failed || abandoned ? "failed" : running ? "running" : "ended",
         provider: meta.provider, model: meta.model,
         title: (angle && angle.data.angle) || role,
         toolCalls, toolCount: toolCalls.length, errorCount, gateBadge, costUsd,
@@ -333,6 +354,37 @@ const PAGE = `<!doctype html>
       });
     }
     return lanes.sort((a, b) => a.start - b.start);
+  }
+
+  /** Plain-text dump of the whole pipeline - every lane, every event, every
+   *  gate check - meant to be pasted straight into a debugging conversation
+   *  with an LLM, so nothing gets lost to summarizing or screenshots. */
+  function buildDebugDump(session, lanes) {
+    const lines = [];
+    lines.push(\`# \${session.topic || session.profile || session.agent}\`);
+    lines.push(\`session: \${session.session_id}\${session.kind === "workflow" ? \` (workflow: \${session.workflow_name || "?"})\` : ""}\`);
+    lines.push(\`status: \${session.status} · \${session.tool_count} tool call(s) · started \${session.started_at} · last event \${session.last_event_at}\`);
+    const totalCost = lanes.reduce((sum, l) => sum + (l.costUsd || 0), 0);
+    lines.push(\`total cost: \${fmtCost(totalCost)}\`);
+    lines.push("");
+    for (const lane of lanes) {
+      lines.push(\`## \${lane.role}\${lane.title && lane.title !== lane.role ? \` - \${lane.title}\` : ""}\`);
+      lines.push(\`model: \${lane.provider ? lane.provider + "/" : ""}\${lane.model || "?"} · status: \${lane.status} · duration: \${fmtDur(lane.end - lane.start) || "0s"} · cost: \${fmtCost(lane.costUsd)}\${lane.errorCount ? \` · \${lane.errorCount} tool error(s)\` : ""}\`);
+      if (lane.gateBadge) lines.push(\`gates: \${lane.gateBadge.passed}/\${lane.gateBadge.total} \${lane.gateBadge.allPass ? "(all passed)" : "(failing)"}\`);
+      lines.push("");
+      for (const e of lane.evts) {
+        const ts = new Date(e.ts).toLocaleTimeString();
+        if (e.type === "gate_result" && e.data && e.data.checks) {
+          const failed = e.data.checks.filter(c => !c.ok).length;
+          lines.push(\`[\${ts}] gate_result attempt \${e.data.attempt} - \${failed === 0 ? "all passed" : \`\${failed} failed\`}\`);
+          for (const c of e.data.checks) lines.push(\`    \${c.ok ? "PASS" : "FAIL"} \${c.name}: \${c.detail}\`);
+        } else {
+          lines.push(\`[\${ts}] \${e.type}\${e.data ? " " + JSON.stringify(e.data) : ""}\`);
+        }
+      }
+      lines.push("");
+    }
+    return lines.join("\\n");
   }
 
   function renderMiniTimeline(lanes, overallStart, overallSpan) {
@@ -362,7 +414,7 @@ const PAGE = `<!doctype html>
       let mini = "";
       let cost = 0;
       if (events && events.length) {
-        const lanes = computeLanes(events, s.agent);
+        const lanes = computeLanes(events, s.agent, s.status);
         const t0 = Math.min(...lanes.map(l => l.start));
         const t1 = Math.max(...lanes.map(l => l.end));
         mini = renderMiniTimeline(lanes, t0, Math.max(t1 - t0, 1000));
@@ -407,7 +459,7 @@ const PAGE = `<!doctype html>
     if (!session) { el.innerHTML = '<div class="empty">Session not found</div>'; return; }
     if (!events.length) { el.innerHTML = '<div class="empty">No events yet</div>'; return; }
 
-    const lanes = computeLanes(events, session.agent);
+    const lanes = computeLanes(events, session.agent, session.status);
     if (!lanes.length) { el.innerHTML = '<div class="empty">No agent activity yet</div>'; return; }
 
     const t0 = Math.min(...lanes.map(l => l.start));
@@ -463,6 +515,8 @@ const PAGE = `<!doctype html>
         <span class="badge \${session.status}">\${session.status}</span>
         <span class="meta">\${session.tool_count} tool calls total</span>
         <span class="meta" title="sum of every lane's real per-turn cost, from pi's own model pricing">&#128176; \${fmtCost(totalCost)} total</span>
+        \${session.kind === "workflow" && session.status === "running" ? '<button class="copy-btn cancel-btn" id="cancel-pipeline" title="Stop this pipeline now and tell the main agent it was cancelled">&#9209; cancel</button>' : ""}
+        <button class="copy-btn" id="copy-debug" title="Copy the full pipeline trace (every lane, every event, every gate check) as plain text">&#128203; copy</button>
       </div>
       <div class="waterfall">\${axisRow}\${laneRows}</div>
       \${laneDetailHtml}
@@ -480,6 +534,44 @@ const PAGE = `<!doctype html>
     });
     const closeBtn = el.querySelector("#lane-detail .close");
     if (closeBtn) closeBtn.addEventListener("click", () => { selectedLane = null; renderDetail(); });
+
+    const cancelBtn = el.querySelector("#cancel-pipeline");
+    if (cancelBtn) {
+      cancelBtn.addEventListener("click", () => {
+        if (!confirm("Cancel this pipeline now? The main agent session that launched it will be told it was cancelled by the user.")) return;
+        cancelBtn.textContent = "cancelling...";
+        cancelBtn.disabled = true;
+        fetch("/api/cancel/" + encodeURIComponent(session.session_id), { method: "POST" })
+          .then(() => { cancelBtn.textContent = "cancelled"; })
+          .catch(() => { cancelBtn.textContent = "cancel failed"; cancelBtn.disabled = false; });
+      });
+    }
+
+    const copyBtn = el.querySelector("#copy-debug");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", () => {
+        const dump = buildDebugDump(session, lanes);
+        const done = (ok) => {
+          copyBtn.textContent = ok ? "\\u2713 copied" : "copy failed";
+          setTimeout(() => { copyBtn.innerHTML = "&#128203; copy"; }, 1500);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(dump).then(() => done(true)).catch(() => done(false));
+        } else {
+          // Fallback for contexts without the async Clipboard API.
+          const ta = document.createElement("textarea");
+          ta.value = dump;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          let ok = false;
+          try { ok = document.execCommand("copy"); } catch { ok = false; }
+          document.body.removeChild(ta);
+          done(ok);
+        }
+      });
+    }
   }
 
   /** Dedicated rollup of this lane's gate_result events (one per validation
@@ -607,6 +699,12 @@ export function startDashboard(port: number): void {
       }
       if (url.pathname === "/api/sessions") {
         return Response.json(summarizeSessions(readAllEvents()));
+      }
+      if (url.pathname.startsWith("/api/cancel/") && req.method === "POST") {
+        const workflowId = url.pathname.slice("/api/cancel/".length);
+        if (!workflowId) return new Response("missing workflowId", { status: 400 });
+        const result = requestCancel(workflowId);
+        return Response.json(result);
       }
       if (url.pathname === "/api/stream") {
         let send!: (data: string) => void;

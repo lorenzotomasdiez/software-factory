@@ -27,6 +27,7 @@ import {
   type SectionEnvelope,
 } from "./gates";
 import { promptTitle, renderTemplate } from "../scout-context/prompts";
+import { clearWorkflow, registerWorkflow, throwIfCancelled, trackChild, untrackChild, WorkflowCancelledError } from "../cancel";
 
 const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -48,6 +49,7 @@ async function spawnPi(opts: {
   dashboardUrl: string;
   tools?: string; // omit for no-tools (pure writing agents like the reviewer)
 }): Promise<SpawnResult> {
+  throwIfCancelled(opts.workflowId);
   const toolArgs = opts.tools ? ["--tools", opts.tools] : ["--no-tools"];
   const proc = Bun.spawn({
     cmd: [
@@ -75,9 +77,13 @@ async function spawnPi(opts: {
       SF_ROLE: opts.role,
       SF_PROFILE: "spec-context",
       SF_DASHBOARD_URL: opts.dashboardUrl,
+      // See scout-context/index.ts's spawnPi for why this override matters.
+      SF_PROVIDER: opts.provider,
+      SF_MODEL: opts.model,
     },
   });
 
+  trackChild(opts.workflowId, proc.pid);
   const timeout = setTimeout(() => proc.kill(), AGENT_TIMEOUT_MS);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -85,6 +91,7 @@ async function spawnPi(opts: {
     proc.exited,
   ]);
   clearTimeout(timeout);
+  untrackChild(opts.workflowId, proc.pid);
   return { stdout, stderr, exitCode };
 }
 
@@ -333,6 +340,26 @@ export async function runSpecContext(topic: string, cwd = process.cwd()): Promis
   ensureSpecContextConfig();
   const cfg = loadSpecContextConfig();
   const workflowId = randomUUID();
+  registerWorkflow(workflowId);
+  try {
+    return await runPipeline();
+  } catch (err) {
+    if (err instanceof WorkflowCancelledError) {
+      emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", { ok: false, cancelled: true });
+      const runDir = join(RUNS_DIR, workflowId);
+      mkdirSync(runDir, { recursive: true });
+      const specMdPath = join(runDir, "spec.md");
+      const specJsonPath = join(runDir, "spec.json");
+      writeFileSync(specMdPath, `# Spec: ${topic}\n\n_Cancelled by the user before finishing._\n`);
+      writeFileSync(specJsonPath, "{}");
+      return { workflowId, ok: false, cancelled: true, topic, sections: [], markdown: "_Cancelled by the user before finishing._", specJson: "{}", specMdPath, specJsonPath };
+    }
+    throw err;
+  } finally {
+    clearWorkflow(workflowId);
+  }
+
+  async function runPipeline(): Promise<SpecContextWorkflowResult> {
   const basePrompt = readBaseAgentPrompt();
   const dashboardUrl = await ensureDashboardRunning();
 
@@ -374,4 +401,5 @@ export async function runSpecContext(topic: string, cwd = process.cwd()): Promis
   });
 
   return { workflowId, ok, topic, sections, markdown: review.markdown, specJson: review.specJson, specMdPath, specJsonPath };
+  }
 }

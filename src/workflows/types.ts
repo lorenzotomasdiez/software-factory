@@ -13,6 +13,7 @@ export interface ScoutResult {
 export interface WorkflowResult {
   workflowId: string;
   ok: boolean;
+  cancelled?: boolean;
   topic: string;
   scouts: ScoutResult[];
   report: string;
@@ -32,6 +33,7 @@ export interface SpecSectionResult {
 export interface SpecContextWorkflowResult {
   workflowId: string;
   ok: boolean;
+  cancelled?: boolean;
   topic: string;
   sections: SpecSectionResult[];
   markdown: string;

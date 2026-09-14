@@ -3,6 +3,7 @@ import { type AgentDefaults, AGENT_FILE, DEFAULT_EXTENSION_FILE, ROOT_DIR, ensur
 import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profiles";
 import { DEFAULT_DASHBOARD_PORT, ensureDashboardRunning, startDashboard } from "./dashboard";
 import { claudeIsolationArgs, piExtensionArgs, piIsolationArgs } from "./agent-launch";
+import { runBuildFeature } from "./workflows/build-feature";
 import { runScoutContext } from "./workflows/scout-context";
 import { runSpecContext } from "./workflows/spec-context";
 import { startVoiceRuntime } from "./voice-runtime";
@@ -27,6 +28,7 @@ Usage:
   sf dashboard [--port <n>]
   sf workflow scout-context "<topic>"
   sf workflow spec-context "<task description>"
+  sf workflow build-feature <spec-json-path-or-workflowId>
   sf --help
 
 Agents:
@@ -52,6 +54,18 @@ Workflows:
                   inside \`sf pi\` via /spec-context <task>, or standalone via
                   the CLI above. Traced in the dashboard as one workflow with
                   a lane per section agent.
+
+  build-feature   ADW-style pipeline that takes a spec-context output and
+                  actually builds it: planner -> architect -> developer <->
+                  tester (tester failures route back to the developer as
+                  concrete correction) -> reviewer. Runs in an isolated git
+                  worktree/branch under ~/.software-factory (never your own
+                  checkout), pushes the branch, and opens/updates a GitHub PR
+                  with a full spec-item coverage matrix. Pass/fail is always
+                  mechanical (a real build command, a real test command,
+                  self-consistency checks) - never an LLM's opinion of its
+                  own work. Takes a spec-context workflowId or a direct path
+                  to a spec.json.
 
 Options:
   --profile <name>   Optional add-on profile, appended on top of the base prompt
@@ -84,6 +98,10 @@ Config lives in ${ROOT_DIR}:
   workflows/spec-context/config.json    models/planner/sections/reviewer registry
   workflows/spec-context/prompts/*.md   per-agent prompts (editable)
   workflows/spec-context/runs/<id>/spec.md, spec.json   one spec per run
+  workflows/build-feature/config.json   models/buildCommand/testCommand/baseBranch registry
+  workflows/build-feature/prompts/*.md  per-agent prompts (editable)
+  workflows/build-feature/worktrees/<id>/   isolated git worktree per run
+  workflows/build-feature/runs/<id>/report.md   one report per run
 
 Examples:
   sf claude
@@ -173,27 +191,67 @@ async function main(): Promise<void> {
 
   if (first === "workflow") {
     const [name, ...rest] = args.slice(1);
-    if (name === "scout-context") {
-      const topic = rest.join(" ").trim();
-      if (!topic) {
-        console.error('sf: usage: sf workflow scout-context "<topic>"');
-        process.exit(1);
+    try {
+      if (name === "scout-context") {
+        const topic = rest.join(" ").trim();
+        if (!topic) {
+          console.error('sf: usage: sf workflow scout-context "<topic>"');
+          process.exit(1);
+        }
+        const result = await runScoutContext(topic);
+        console.log(result.report);
+        if (result.cancelled) {
+          console.log("\nsf: scout-context CANCELLED_BY_USER");
+          process.exit(130);
+        }
+        process.exit(result.ok ? 0 : 1);
       }
-      const result = await runScoutContext(topic);
-      console.log(result.report);
-      process.exit(result.ok ? 0 : 1);
-    }
-    if (name === "spec-context") {
-      const topic = rest.join(" ").trim();
-      if (!topic) {
-        console.error('sf: usage: sf workflow spec-context "<task description>"');
-        process.exit(1);
+      if (name === "spec-context") {
+        const topic = rest.join(" ").trim();
+        if (!topic) {
+          console.error('sf: usage: sf workflow spec-context "<task description>"');
+          process.exit(1);
+        }
+        const result = await runSpecContext(topic);
+        console.log(result.markdown);
+        if (result.cancelled) {
+          console.log("\nsf: spec-context CANCELLED_BY_USER");
+          process.exit(130);
+        }
+        console.log(`\nsf: spec-context ${result.ok ? "succeeded" : "finished with unresolved gate failures"}`);
+        console.log(`  workflowId: ${result.workflowId}`);
+        console.log(`  spec.json:  ${result.specJsonPath}`);
+        console.log(`  next: sf workflow build-feature ${result.workflowId}`);
+        process.exit(result.ok ? 0 : 1);
       }
-      const result = await runSpecContext(topic);
-      console.log(result.markdown);
-      process.exit(result.ok ? 0 : 1);
+      if (name === "build-feature") {
+        const specInput = rest.join(" ").trim();
+        if (!specInput) {
+          console.error("sf: usage: sf workflow build-feature <spec-json-path-or-workflowId>");
+          process.exit(1);
+        }
+        const result = await runBuildFeature(specInput);
+        if (result.cancelled) {
+          console.log("sf: build-feature CANCELLED_BY_USER");
+          console.log(`  report: ${result.reportPath}`);
+          process.exit(130);
+        }
+        console.log(`sf: build-feature ${result.ok ? "succeeded" : "failed"}`);
+        if (result.error) console.log(`  error: ${result.error}`);
+        console.log(`  branch: ${result.branch || "(none - nothing was committed)"}`);
+        if (result.prUrl) console.log(`  PR: ${result.prUrl}`);
+        console.log(`  report: ${result.reportPath}`);
+        process.exit(result.ok ? 0 : 1);
+      }
+    } catch (err) {
+      // Any thrown error here (bad input, missing spec.json, git/gh failures,
+      // invalid config) would otherwise surface as a raw uncaught-exception
+      // stack trace pointing at bundled/minified line numbers - useless to a
+      // human. Print just the message instead.
+      console.error(`sf: workflow "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
     }
-    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context, spec-context`);
+    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context, spec-context, build-feature`);
     process.exit(1);
   }
 

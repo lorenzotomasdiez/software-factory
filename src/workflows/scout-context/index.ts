@@ -18,6 +18,7 @@ import {
 } from "./config";
 import { extractJson, isScoutEnvelope, reviewerGates, scoutGates } from "./gates";
 import { promptTitle, renderTemplate } from "./prompts";
+import { clearWorkflow, registerWorkflow, throwIfCancelled, trackChild, untrackChild, WorkflowCancelledError } from "../cancel";
 
 const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -39,6 +40,7 @@ async function spawnPi(opts: {
   dashboardUrl: string;
   tools?: string; // omit for no-tools (pure writing agents like the reviewer)
 }): Promise<SpawnResult> {
+  throwIfCancelled(opts.workflowId);
   const toolArgs = opts.tools ? ["--tools", opts.tools] : ["--no-tools"];
   const proc = Bun.spawn({
     cmd: [
@@ -66,9 +68,16 @@ async function spawnPi(opts: {
       SF_ROLE: opts.role,
       SF_PROFILE: "scout-context",
       SF_DASHBOARD_URL: opts.dashboardUrl,
+      // Overrides whatever SF_PROVIDER/SF_MODEL a parent `sf pi` session left
+      // in the environment - otherwise the default extension's own
+      // session_start event reports the OUTER interactive session's model
+      // instead of this specific sub-agent's, which is what actually ran.
+      SF_PROVIDER: opts.provider,
+      SF_MODEL: opts.model,
     },
   });
 
+  trackChild(opts.workflowId, proc.pid);
   const timeout = setTimeout(() => proc.kill(), AGENT_TIMEOUT_MS);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -76,6 +85,7 @@ async function spawnPi(opts: {
     proc.exited,
   ]);
   clearTimeout(timeout);
+  untrackChild(opts.workflowId, proc.pid);
   return { stdout, stderr, exitCode };
 }
 
@@ -241,6 +251,24 @@ export async function runScoutContext(topic: string, cwd = process.cwd()): Promi
   ensureScoutContextConfig();
   const cfg = loadScoutContextConfig();
   const workflowId = randomUUID();
+  registerWorkflow(workflowId);
+  try {
+    return await runPipeline();
+  } catch (err) {
+    if (err instanceof WorkflowCancelledError) {
+      emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", { ok: false, cancelled: true });
+      const runDir = join(RUNS_DIR, workflowId);
+      mkdirSync(runDir, { recursive: true });
+      const reportPath = join(runDir, "report.md");
+      writeFileSync(reportPath, `# Scout report: ${topic}\n\n_Cancelled by the user before finishing._\n`);
+      return { workflowId, ok: false, cancelled: true, topic, scouts: [], report: "_Cancelled by the user before finishing._", reportPath };
+    }
+    throw err;
+  } finally {
+    clearWorkflow(workflowId);
+  }
+
+  async function runPipeline(): Promise<WorkflowResult> {
   const basePrompt = readBaseAgentPrompt();
   const dashboardUrl = await ensureDashboardRunning();
 
@@ -280,4 +308,5 @@ export async function runScoutContext(topic: string, cwd = process.cwd()): Promi
   });
 
   return { workflowId, ok, topic, scouts, report: review.report, reportPath };
+  }
 }

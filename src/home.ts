@@ -216,6 +216,14 @@ export default function (pi: ExtensionAPI) {
       // exists rather than throwing away real work because of an exit code.
       // Only a truly empty report - a crash before anything was written -
       // is treated as a hard failure with no data.
+      if (exitCode === 130) {
+        ctx.ui.notify("scout-context was cancelled by the user from the dashboard.", "warning");
+        pi.sendUserMessage(
+          \`The scout-context run on "\${args}" was CANCELLED BY THE USER (from the dashboard's cancel button) before it finished. Do not retry or continue it - just acknowledge the cancellation to the user.\`,
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
       if (!report.trim()) {
         ctx.ui.notify(\`scout-context failed: \${err.slice(0, 300) || "no report was produced"}\`, "error");
         return;
@@ -224,7 +232,7 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(\`scout-context finished with a warning - see \${process.env.SF_DASHBOARD_URL || "sf dashboard"} for which gate failed. Delivering the report anyway.\`, "warning");
       }
       pi.sendUserMessage(
-        \`Here is the scout-context report on "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft and double-check anything surprising)" : ""}. Use it to answer, don't re-scout unless it's missing something:\\n\\n\${report}\`,
+        \`Here is the scout-context report on "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft and double-check anything surprising)" : ""}. Use it to ANSWER the user - do not edit any files or act on any "Actions"/"Findings" it lists unless the user explicitly asks you to make changes after seeing this report. Don't re-scout unless it's missing something:\\n\\n\${report}\`,
         { deliverAs: "followUp" },
       );
     },
@@ -253,6 +261,14 @@ export default function (pi: ExtensionAPI) {
       // own gates weren't fully satisfied, not that nothing was produced -
       // \`sf workflow spec-context\` always writes spec.md/spec.json, even a
       // fallback concatenation, so surface whatever exists.
+      if (exitCode === 130) {
+        ctx.ui.notify("spec-context was cancelled by the user from the dashboard.", "warning");
+        pi.sendUserMessage(
+          \`The spec-context run for "\${args}" was CANCELLED BY THE USER (from the dashboard's cancel button) before it finished. Do not retry or continue it - just acknowledge the cancellation to the user.\`,
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
       if (!report.trim()) {
         ctx.ui.notify(\`spec-context failed: \${err.slice(0, 300) || "no spec was produced"}\`, "error");
         return;
@@ -261,7 +277,49 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(\`spec-context finished with a warning - see \${process.env.SF_DASHBOARD_URL || "sf dashboard"} for which gate failed. Delivering the spec anyway.\`, "warning");
       }
       pi.sendUserMessage(
-        \`spec-context finished for "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft)" : ""}. It has been saved to spec.md and spec.json under workflows/spec-context/runs/ in the sf home dir. This is raw context for a separate, not-yet-built command to consume later - do NOT start implementing anything from it now. Just confirm it's ready and tell the user where it was saved. For reference, here is the generated spec:\\n\\n\${report}\`,
+        \`spec-context finished for "\${args}"\${exitCode !== 0 ? " (one or more deterministic gates did not fully pass - treat it as a best-effort draft)" : ""}. This is raw context for the separate build-feature workflow to consume later - do NOT start implementing anything from it now. The output below ends with the workflowId, the spec.json path, and the exact "sf workflow build-feature <workflowId>" command to run next - relay that command to the user verbatim, they'll need it. Here is the generated spec:\\n\\n\${report}\`,
+        { deliverAs: "followUp" },
+      );
+    },
+  });
+
+  pi.registerCommand("build-feature", {
+    description: "Run the full planner/architect/developer/tester/reviewer pipeline against a spec-context output, on its own branch, and open a PR",
+    handler: async (args, ctx) => {
+      if (!args?.trim()) {
+        ctx.ui.notify("Usage: /build-feature <spec-context workflowId or path to spec.json>", "warning");
+        return;
+      }
+      interruptVoicePlayback();
+      ctx.ui.notify(\`build-feature: \${args} (this runs a full dev pipeline in the background - can take a while, see \${process.env.SF_DASHBOARD_URL || "sf dashboard"})\`, "info");
+      const { out, err, exitCode } = await new Promise<{ out: string; err: string; exitCode: number }>((resolve) => {
+        const proc = spawn("sf", ["workflow", "build-feature", args], { cwd: ctx.cwd });
+        let out = "";
+        let errOut = "";
+        proc.stdout.on("data", (chunk) => (out += chunk));
+        proc.stderr.on("data", (chunk) => (errOut += chunk));
+        proc.on("close", (code) => resolve({ out, err: errOut, exitCode: code ?? 1 }));
+      });
+      if (exitCode === 130) {
+        ctx.ui.notify("build-feature was cancelled by the user from the dashboard.", "warning");
+        pi.sendUserMessage(
+          \`The build-feature run for "\${args}" was CANCELLED BY THE USER (from the dashboard's cancel button) before it finished. Whatever branch/commits/PR existed at that point are left as-is - do not retry or continue it, and do not assume it's ready. Just acknowledge the cancellation to the user.\\n\\n\${out}\`,
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
+      if (!out.trim()) {
+        ctx.ui.notify(\`build-feature failed before producing anything: \${err.slice(0, 300) || "no output"}\`, "error");
+        return;
+      }
+      // A nonzero exit can mean anything from "reviewer gates didn't fully
+      // pass, PR is up" to "failed at the architect, nothing was built" - the
+      // CLI output below says which (error/branch/PR lines), so relay it as-is.
+      if (exitCode !== 0) {
+        ctx.ui.notify(\`build-feature failed - see \${process.env.SF_DASHBOARD_URL || "sf dashboard"}\`, "warning");
+      }
+      pi.sendUserMessage(
+        \`build-feature \${exitCode === 0 ? "succeeded" : "FAILED"} for "\${args}". Report the outcome to the user exactly as below (error, branch, PR). Do not try to fix, re-run or continue the pipeline yourself unless the user asks.\\n\\n\${out}\`,
         { deliverAs: "followUp" },
       );
     },
