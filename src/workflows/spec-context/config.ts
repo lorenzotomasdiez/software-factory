@@ -46,7 +46,8 @@ const DEFAULT_CONFIG: SpecContextConfig = {
     deepseek: { provider: "openrouter", model: "deepseek/deepseek-v3.2" },
     sonnet: { provider: "openrouter", model: "anthropic/claude-sonnet-5" },
     opus: { provider: "openrouter", model: "anthropic/claude-opus-5" },
-    kimi: { provider: "openrouter", model: "moonshotai/kimi-k2" },
+    // Kimi subscription (OAuth-logged in pi), not pay-per-token OpenRouter.
+    kimi: { provider: "kimi-coding", model: "k3" },
     gemini: { provider: "openrouter", model: "google/gemini-3.8-flash" },
   },
   // Planning which sections apply is low cognitive load - cheap/fast model.
@@ -189,10 +190,32 @@ export function ensureSpecContextConfig(): void {
   mkdirSync(RUNS_DIR, { recursive: true });
   if (!existsSync(CONFIG_FILE)) {
     writeFileSync(CONFIG_FILE, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`);
+  } else {
+    migrateConfigFile();
   }
   for (const [file, content] of Object.entries(DEFAULT_PROMPTS)) {
     const path = join(PROMPTS_DIR, file);
     if (!existsSync(path)) writeFileSync(path, content);
+  }
+}
+
+/**
+ * config.json is only written once, so fixes to DEFAULT_CONFIG never reach an
+ * existing install on their own. This upgrades values that are still exactly
+ * an old shipped default (never anything the user changed by hand):
+ * - moves "kimi" off OpenRouter onto the kimi-coding subscription provider.
+ */
+function migrateConfigFile(): void {
+  let cfg: SpecContextConfig;
+  try {
+    cfg = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) as SpecContextConfig;
+  } catch {
+    return; // leave a broken file for loadSpecContextConfig to report clearly
+  }
+  const kimi = cfg.models?.kimi;
+  if (kimi?.provider === "openrouter" && kimi?.model === "moonshotai/kimi-k2") {
+    cfg.models.kimi = DEFAULT_CONFIG.models.kimi;
+    writeFileSync(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`);
   }
 }
 

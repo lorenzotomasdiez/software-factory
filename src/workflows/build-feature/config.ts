@@ -49,7 +49,8 @@ const DEFAULT_CONFIG: BuildFeatureConfig = {
     opus: { provider: "openrouter", model: "anthropic/claude-opus-5" },
     sonnet: { provider: "openrouter", model: "anthropic/claude-sonnet-5" },
     deepseek: { provider: "openrouter", model: "deepseek/deepseek-v3.2" },
-    kimi: { provider: "openrouter", model: "moonshotai/kimi-k3" },
+    // Kimi subscription (OAuth-logged in pi), not pay-per-token OpenRouter.
+    kimi: { provider: "kimi-coding", model: "k3" },
     gemini: { provider: "openrouter", model: "google/gemini-3.8-flash" },
   },
   planner: { role: "planner", modelKey: "terra", promptFile: "planner.md" },
@@ -223,6 +224,7 @@ export function ensureBuildFeatureConfig(): void {
  * - adds model keys introduced later (e.g. "gemini"),
  * - moves architect/reviewer off the original "opus" default, which fails
  *   every call via OpenRouter (see DEFAULT_CONFIG),
+ * - moves "kimi" off OpenRouter onto the kimi-coding subscription provider,
  * - replaces the original bun-only build/test commands with "auto".
  */
 function migrateConfigFile(): void {
@@ -249,6 +251,12 @@ function migrateConfigFile(): void {
       cfg[role].modelKey = DEFAULT_CONFIG[role].modelKey;
       changed = true;
     }
+  }
+
+  const kimi = cfg.models.kimi;
+  if (kimi?.provider === "openrouter" && kimi?.model === "moonshotai/kimi-k3") {
+    cfg.models.kimi = DEFAULT_CONFIG.models.kimi;
+    changed = true;
   }
 
   if (cfg.buildCommand === "bunx tsc --noEmit") {
