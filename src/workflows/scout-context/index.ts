@@ -41,6 +41,7 @@ async function spawnPi(opts: {
   tools?: string; // omit for no-tools (pure writing agents like the reviewer)
 }): Promise<SpawnResult> {
   throwIfCancelled(opts.workflowId);
+  emitWorkflowEvent(opts.workflowId, opts.role, "session_started", { sessionId: opts.sessionId, cwd: opts.cwd });
   const toolArgs = opts.tools ? ["--tools", opts.tools] : ["--no-tools"];
   const proc = Bun.spawn({
     cmd: [

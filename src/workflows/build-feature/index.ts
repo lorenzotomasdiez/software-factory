@@ -66,6 +66,7 @@ async function spawnPi(opts: {
   toolMode: ToolMode;
 }): Promise<SpawnResult> {
   throwIfCancelled(opts.workflowId);
+  emitWorkflowEvent(opts.workflowId, opts.role, "session_started", { sessionId: opts.sessionId, cwd: opts.cwd });
   const toolArgs = opts.toolMode === "readonly" ? ["--tools", "read,grep,find,ls"] : opts.toolMode === "none" ? ["--no-tools"] : [];
   const proc = Bun.spawn({
     cmd: [

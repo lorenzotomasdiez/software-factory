@@ -102,7 +102,7 @@ export default function (pi: ExtensionAPI) {
     const modelPart = provider && model ? \` · \${provider}/\${model}\` : "";
     const obsPart = dashboardUrl ? \` · obs: \${dashboardUrl}\` : "";
     ctx.ui.setStatus("software-factory", \`🏭 sf · \${profile}\${modelPart}\${obsPart}\`);
-    emit(sessionId, "session_start", { reason: event.reason });
+    emit(sessionId, "session_start", { reason: event.reason, cwd: process.cwd() });
   });
 
   pi.on("tool_execution_start", async (event) => {

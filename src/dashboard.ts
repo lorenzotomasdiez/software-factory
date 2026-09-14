@@ -1,11 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, watch } from "node:fs";
 import { join } from "node:path";
 import { EVENTS_DIR } from "./home";
+import { getReportJob, startReportJob } from "./report-runner";
 import { isWorkflowAlive, requestCancel } from "./workflows/cancel";
 
 export const DEFAULT_DASHBOARD_PORT = 4317;
 
-interface SfEvent {
+export interface SfEvent {
   ts: string;
   session_id: string;
   agent: string;
@@ -18,7 +19,7 @@ interface SfEvent {
   data?: unknown;
 }
 
-function readAllEvents(): SfEvent[] {
+export function readAllEvents(): SfEvent[] {
   if (!existsSync(EVENTS_DIR)) return [];
   const files = readdirSync(EVENTS_DIR).filter((f) => f.endsWith(".jsonl"));
   const events: SfEvent[] = [];
@@ -43,7 +44,7 @@ interface Lane {
   tool_count: number;
 }
 
-interface SessionSummary {
+export interface SessionSummary {
   session_id: string; // workflow_id when this row is a workflow, else the plain session id
   kind: "session" | "workflow";
   agent: string;
@@ -61,7 +62,7 @@ interface SessionSummary {
 }
 
 /** Groups by workflow_id when present (orchestrator + all its scout lanes together), else by session_id. */
-function summarizeSessions(events: SfEvent[]): SessionSummary[] {
+export function summarizeSessions(events: SfEvent[]): SessionSummary[] {
   const groups = new Map<string, SfEvent[]>();
   for (const e of events) {
     const key = e.workflow_id || e.session_id;
@@ -259,6 +260,11 @@ const PAGE = `<!doctype html>
   let selectedLane = null;
   let sessions = [];
   const eventsCache = new Map();
+  // Survives renderDetail() rebuilding #detail's innerHTML from scratch on
+  // every refresh (SSE update, or the 1s tick while anything is running) -
+  // without this, an in-flight "generate report" click's button state and
+  // poll loop get silently wiped mid-generation, looking like the click did nothing.
+  const reportJobState = new Map();
 
   function hashColor(role) {
     let h = 0;
@@ -517,6 +523,7 @@ const PAGE = `<!doctype html>
         <span class="meta" title="sum of every lane's real per-turn cost, from pi's own model pricing">&#128176; \${fmtCost(totalCost)} total</span>
         \${session.kind === "workflow" && session.status === "running" ? '<button class="copy-btn cancel-btn" id="cancel-pipeline" title="Stop this pipeline now and tell the main agent it was cancelled">&#9209; cancel</button>' : ""}
         <button class="copy-btn" id="copy-debug" title="Copy the full pipeline trace (every lane, every event, every gate check) as plain text">&#128203; copy</button>
+        <button class="copy-btn" id="generate-report" title="Generate a rich HTML report of every role's full conversation and handoffs, via the lavish skill">\${reportButtonLabel(session.session_id)}</button>
       </div>
       <div class="waterfall">\${axisRow}\${laneRows}</div>
       \${laneDetailHtml}
@@ -572,6 +579,92 @@ const PAGE = `<!doctype html>
         }
       });
     }
+
+    const reportBtn = el.querySelector("#generate-report");
+    if (reportBtn) {
+      applyReportButtonState(reportBtn, session.session_id);
+      reportBtn.addEventListener("click", () => requestReport(session.session_id));
+    }
+  }
+
+  // Renders straight from reportJobState so a mid-flight rebuild of #detail
+  // (SSE update, or the 1s tick) shows the same state instead of resetting
+  // the button to its idle label while a report is still generating.
+  function reportButtonLabel(id) {
+    const job = reportJobState.get(id);
+    if (!job) return "&#128196; report";
+    if (job.state === "generating") return "generating...";
+    if (job.state === "done") return "&#9989; open report";
+    if (job.state === "error") return "&#9888; report failed";
+    return "&#128196; report";
+  }
+
+  function applyReportButtonState(btn, id) {
+    const job = reportJobState.get(id);
+    btn.disabled = job?.state === "generating";
+    if (job?.state === "error" && job.error) btn.title = job.error;
+    if (job?.state === "done") {
+      btn.onclick = () => window.open("/api/report/" + encodeURIComponent(id) + "/file", "_blank");
+    }
+    // Rebuilds fully replace the button node, so a poll already running for
+    // this id (started before this rebuild) needs to be re-armed against it.
+    if (job?.state === "generating" && !job.polling) {
+      job.polling = true;
+      pollReportStatus(id);
+    }
+  }
+
+  function refreshReportButton(id) {
+    const btn = document.getElementById("generate-report");
+    if (!btn || selectedId !== id) return;
+    btn.innerHTML = reportButtonLabel(id);
+    applyReportButtonState(btn, id);
+  }
+
+  function pollReportStatus(id) {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch("/api/report/" + encodeURIComponent(id) + "/status");
+        const job = await res.json();
+        if (job.status === "done") {
+          clearInterval(interval);
+          reportJobState.set(id, { state: "done" });
+        } else if (job.status === "error") {
+          clearInterval(interval);
+          reportJobState.set(id, { state: "error", error: job.error });
+        } else {
+          return; // still running - leave state as "generating" and keep polling
+        }
+        refreshReportButton(id);
+      } catch {
+        // transient fetch error while polling - keep trying until the interval is cleared
+      }
+    }, 2000);
+  }
+
+  function requestReport(id) {
+    reportJobState.set(id, { state: "generating", polling: true });
+    refreshReportButton(id);
+    fetch("/api/report/" + encodeURIComponent(id), { method: "POST" })
+      .then(async (res) => {
+        if (res.status === 409) {
+          const body = await res.json();
+          if (confirm(body.error + " - generate anyway?")) {
+            return fetch("/api/report/" + encodeURIComponent(id) + "?force=1", { method: "POST" });
+          }
+          reportJobState.delete(id);
+          refreshReportButton(id);
+          return null;
+        }
+        return res;
+      })
+      .then((res) => {
+        if (res) pollReportStatus(id);
+      })
+      .catch(() => {
+        reportJobState.set(id, { state: "error", error: "request failed" });
+        refreshReportButton(id);
+      });
   }
 
   /** Dedicated rollup of this lane's gate_result events (one per validation
@@ -705,6 +798,29 @@ export function startDashboard(port: number): void {
         if (!workflowId) return new Response("missing workflowId", { status: 400 });
         const result = requestCancel(workflowId);
         return Response.json(result);
+      }
+      if (url.pathname.startsWith("/api/report/") && url.pathname.endsWith("/status") && req.method === "GET") {
+        const id = url.pathname.slice("/api/report/".length, -"/status".length);
+        if (!id) return new Response("missing id", { status: 400 });
+        return Response.json(getReportJob(id) ?? { status: "not_started" });
+      }
+      if (url.pathname.startsWith("/api/report/") && url.pathname.endsWith("/file") && req.method === "GET") {
+        const id = url.pathname.slice("/api/report/".length, -"/file".length);
+        const job = getReportJob(id);
+        if (!job?.outputPath || !existsSync(job.outputPath)) return new Response("not found", { status: 404 });
+        return new Response(Bun.file(job.outputPath));
+      }
+      if (url.pathname.startsWith("/api/report/") && req.method === "POST") {
+        const id = url.pathname.slice("/api/report/".length);
+        if (!id) return new Response("missing id", { status: 400 });
+        const force = url.searchParams.get("force") === "1";
+        if (!force) {
+          const target = summarizeSessions(readAllEvents()).find((s) => s.session_id === id);
+          if (target?.status === "running") {
+            return Response.json({ error: "still running - report may be incomplete", allowAnyway: true }, { status: 409 });
+          }
+        }
+        return Response.json(startReportJob(id, { force }));
       }
       if (url.pathname === "/api/stream") {
         let send!: (data: string) => void;
