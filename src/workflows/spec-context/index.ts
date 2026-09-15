@@ -28,8 +28,8 @@ import {
 } from "./gates";
 import { promptTitle, renderTemplate } from "../scout-context/prompts";
 import { clearWorkflow, registerWorkflow, throwIfCancelled, trackChild, untrackChild, WorkflowCancelledError } from "../cancel";
-
-const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
+import { watchAgent } from "../agent-watchdog";
+import { nameWorkFromSpec, NAMING_RULES, writeWorkMeta, type WorkName } from "../work-title";
 
 interface SpawnResult {
   stdout: string;
@@ -85,15 +85,17 @@ async function spawnPi(opts: {
   });
 
   trackChild(opts.workflowId, proc.pid);
-  const timeout = setTimeout(() => proc.kill(), AGENT_TIMEOUT_MS);
+  const stopWatchdog = watchAgent(proc, opts.workflowId, opts.role);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  clearTimeout(timeout);
+  const timedOut = stopWatchdog();
   untrackChild(opts.workflowId, proc.pid);
-  return { stdout, stderr, exitCode };
+  // A harness kill leaves only pi's incidental startup noise on stderr (e.g.
+  // "No project session found..."), which callers would report as the cause.
+  return { stdout, stderr: timedOut ? `agent stopped by the harness: ${timedOut}` : stderr, exitCode: timedOut ? exitCode || 1 : exitCode };
 }
 
 async function runPlanner(
@@ -103,7 +105,7 @@ async function runPlanner(
   workflowId: string,
   cwd: string,
   dashboardUrl: string,
-): Promise<{ sections: SectionAgentSpec[]; ok: boolean; error?: string }> {
+): Promise<{ sections: SectionAgentSpec[]; name?: WorkName; ok: boolean; error?: string }> {
   const spec = cfg.planner;
   const template = readFileSync(join(PROMPTS_DIR, spec.promptFile), "utf-8");
   const instructionBody = renderTemplate(template, { TOPIC: topic });
@@ -111,6 +113,7 @@ async function runPlanner(
     basePrompt,
     "You are the planning agent inside software-factory's `spec-context` workflow.",
     instructionBody,
+    `${NAMING_RULES}\n- "title" and "type" go in the same json block as "sections". If the task points at a file or document, READ it first.`,
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -120,6 +123,9 @@ async function runPlanner(
   emitWorkflowEvent(workflowId, spec.role, "scout_start", { angle: promptTitle(template), provider, model });
 
   let lastError = "";
+  // Sections from an attempt whose only problem was the name: still worth
+  // using - the naming can be recovered from the finished spec later.
+  let sectionsOnly: PlannerEnvelope["sections"] | undefined;
   for (let attempt = 1; attempt <= cfg.retries + 1; attempt++) {
     const prompt =
       attempt === 1
@@ -147,14 +153,17 @@ async function runPlanner(
 
     try {
       const parsed = extractJson(result.stdout);
-      const checks = plannerGates(parsed);
+      const checks = plannerGates(parsed, topic);
       const failed = checks.filter((c) => !c.ok);
       emitWorkflowEvent(workflowId, spec.role, "gate_result", { attempt, checks });
       if (failed.length === 0 && isPlannerEnvelope(parsed)) {
-        const chosen = cfg.sections.filter((s) => (parsed as PlannerEnvelope).sections.includes(s.section));
-        emitWorkflowEvent(workflowId, spec.role, "scout_end", { ok: true, attempt, sections: chosen.map((s) => s.section) });
-        return { sections: chosen.length ? chosen : cfg.sections, ok: true };
+        const envelope = parsed as PlannerEnvelope;
+        const chosen = cfg.sections.filter((s) => envelope.sections.includes(s.section));
+        const name = { title: envelope.title.trim(), type: envelope.type };
+        emitWorkflowEvent(workflowId, spec.role, "scout_end", { ok: true, attempt, sections: chosen.map((s) => s.section), ...name });
+        return { sections: chosen.length ? chosen : cfg.sections, name, ok: true };
       }
+      if (!failed.some((f) => f.name === "envelope_shape")) sectionsOnly = (parsed as PlannerEnvelope).sections;
       lastError = failed.map((f) => `${f.name}: ${f.detail}`).join("; ");
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
@@ -162,10 +171,40 @@ async function runPlanner(
     emitWorkflowEvent(workflowId, spec.role, "scout_retry", { attempt, error: lastError });
   }
 
-  // Planner never produced a valid section list - fail open and run every
-  // configured section rather than produce zero context.
-  emitWorkflowEvent(workflowId, spec.role, "scout_end", { ok: false, error: lastError, fallback: "all sections" });
-  return { sections: cfg.sections, ok: false, error: lastError };
+  const chosen = sectionsOnly ? cfg.sections.filter((s) => sectionsOnly!.includes(s.section)) : [];
+  // No valid section list at all - fail open and run every configured
+  // section rather than produce zero context.
+  emitWorkflowEvent(workflowId, spec.role, "scout_end", { ok: false, error: lastError, fallback: chosen.length ? "unnamed" : "all sections" });
+  return { sections: chosen.length ? chosen : cfg.sections, ok: false, error: lastError };
+}
+
+/** Names the work from the finished spec when the planner couldn't - never from the raw request. */
+async function runNamer(
+  cfg: SpecContextConfig,
+  topic: string,
+  review: { markdown: string; specJson: string },
+  workflowId: string,
+  cwd: string,
+  dashboardUrl: string,
+): Promise<WorkName | undefined> {
+  const role = "namer";
+  // The reviewer's model authored no spec content, so it's the least biased reader of it.
+  const { provider, model } = resolveModel(cfg, cfg.reviewer.modelKey);
+  emitWorkflowEvent(workflowId, role, "scout_start", { angle: "Work namer", provider, model });
+  const result = await nameWorkFromSpec({
+    topic,
+    specJson: review.specJson,
+    specMarkdown: review.markdown,
+    retries: cfg.retries,
+    run: (systemPrompt, prompt, attempt) =>
+      spawnPi({ provider, model, systemPrompt, prompt, sessionId: `sf-spec-namer-${workflowId}-${attempt}`, cwd, workflowId, role, dashboardUrl }),
+    onAttempt: (attempt, checks, error) => {
+      if (checks) emitWorkflowEvent(workflowId, role, "gate_result", { attempt, checks });
+      if (error) emitWorkflowEvent(workflowId, role, "scout_retry", { attempt, error });
+    },
+  });
+  emitWorkflowEvent(workflowId, role, "scout_end", result.ok ? { ok: true, ...result.name } : { ok: false, error: result.error });
+  return result.ok ? result.name : undefined;
 }
 
 async function runSectionAgent(
@@ -371,6 +410,8 @@ export async function runSpecContext(topic: string, cwd = process.cwd()): Promis
   });
 
   const plan = await runPlanner(cfg, basePrompt, topic, workflowId, cwd, dashboardUrl);
+  // workflow_start could only carry the raw request; this is the real name.
+  if (plan.name) emitWorkflowEvent(workflowId, "orchestrator", "workflow_title", { ...plan.name, namedBy: "planner" });
 
   const sections = await Promise.all(
     plan.sections.map((spec) => runSectionAgent(cfg, basePrompt, spec, topic, workflowId, cwd, dashboardUrl)),
@@ -392,15 +433,26 @@ export async function runSpecContext(topic: string, cwd = process.cwd()): Promis
   writeFileSync(specMdPath, review.markdown);
   writeFileSync(specJsonPath, review.specJson);
 
+  let name = plan.name;
+  if (!name) {
+    name = await runNamer(cfg, topic, review, workflowId, cwd, dashboardUrl);
+    if (name) emitWorkflowEvent(workflowId, "orchestrator", "workflow_title", { ...name, namedBy: "namer" });
+  }
+  // No meta.json means "not named yet": build-feature names it from the spec
+  // before creating a branch, so an unnamed spec never becomes a raw-request branch.
+  const metaPath = name ? writeWorkMeta(runDir, { workflowId, topic, ...name }) : undefined;
+
   emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", {
     ok,
+    title: name?.title,
     specMdPath,
     specJsonPath,
+    metaPath,
     plannerOk: plan.ok,
     reviewOk: review.ok,
     failedSections: failedSections.map((s) => s.section),
   });
 
-  return { workflowId, ok, topic, sections, markdown: review.markdown, specJson: review.specJson, specMdPath, specJsonPath };
+  return { workflowId, ok, topic, title: name?.title, type: name?.type, sections, markdown: review.markdown, specJson: review.specJson, specMdPath, specJsonPath };
   }
 }

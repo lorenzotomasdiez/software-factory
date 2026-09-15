@@ -48,21 +48,21 @@ const DEFAULT_CONFIG: BuildFeatureConfig = {
     luna: { provider: "openai-codex", model: "gpt-5.6-luna" },
     opus: { provider: "openrouter", model: "anthropic/claude-opus-5" },
     sonnet: { provider: "openrouter", model: "anthropic/claude-sonnet-5" },
-    deepseek: { provider: "openrouter", model: "deepseek/deepseek-v3.2" },
+    deepseek: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     // Kimi subscription (OAuth-logged in pi), not pay-per-token OpenRouter.
     kimi: { provider: "kimi-coding", model: "k3" },
     gemini: { provider: "openrouter", model: "google/gemini-3.8-flash" },
   },
   planner: { role: "planner", modelKey: "terra", promptFile: "planner.md" },
-  // "opus" (anthropic/claude-opus-5 via openrouter) reproducibly fails every
-  // single attempt with "Mid-conversation reasoning effort (configuration_
-  // update) is not supported" - confirmed independent of session reuse (it
-  // fails on a brand-new session too), so it looks like an OpenRouter routing
-  // incompatibility with Pi's reasoning-effort request shape for that model
-  // right now, not something under this codebase's control. Defaulting
-  // architect/reviewer to "gemini" instead, which has run clean end-to-end in
-  // scout-context/spec-context. "opus" stays in `models` below to switch back
-  // to (just edit modelKey here) once/if that combination works again.
+  // "opus" (anthropic/claude-opus-5 via openrouter) fails every call with
+  // "Mid-conversation reasoning effort (configuration_update) is not
+  // supported" unless pi is told not to send that block: pi's built-in
+  // catalog marks the model `compat.supportsMidConvoEffort: true`, which
+  // OpenRouter rejects. The fix is a pi `modelOverrides` entry in
+  // ~/.pi/agent/models.json setting it to false (plus a lower `maxTokens`,
+  // since OpenRouter reserves credit for pi's 128k default). Architect/reviewer
+  // default to "gemini" so a fresh install works without that override;
+  // switch modelKey back to "opus" once it's in place.
   architect: { role: "architect", modelKey: "gemini", promptFile: "architect.md" },
   developer: { role: "developer", modelKey: "deepseek", promptFile: "developer.md" },
   tester: { role: "tester", modelKey: "kimi", promptFile: "tester.md" },
@@ -225,6 +225,7 @@ export function ensureBuildFeatureConfig(): void {
  * - moves architect/reviewer off the original "opus" default, which fails
  *   every call via OpenRouter (see DEFAULT_CONFIG),
  * - moves "kimi" off OpenRouter onto the kimi-coding subscription provider,
+ * - moves "deepseek" from v3.2 to v4.1-flash,
  * - replaces the original bun-only build/test commands with "auto".
  */
 function migrateConfigFile(): void {
@@ -256,6 +257,12 @@ function migrateConfigFile(): void {
   const kimi = cfg.models.kimi;
   if (kimi?.provider === "openrouter" && kimi?.model === "moonshotai/kimi-k3") {
     cfg.models.kimi = DEFAULT_CONFIG.models.kimi;
+    changed = true;
+  }
+
+  const deepseek = cfg.models.deepseek;
+  if (deepseek?.provider === "openrouter" && deepseek?.model === "deepseek/deepseek-v3.2") {
+    cfg.models.deepseek = DEFAULT_CONFIG.models.deepseek;
     changed = true;
   }
 

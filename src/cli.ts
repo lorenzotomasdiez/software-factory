@@ -6,6 +6,7 @@ import { claudeIsolationArgs, piExtensionArgs, piIsolationArgs } from "./agent-l
 import { runBuildFeature } from "./workflows/build-feature";
 import { runScoutContext } from "./workflows/scout-context";
 import { runSpecContext } from "./workflows/spec-context";
+import { stripWrappingQuotes } from "./workflows/work-title";
 import { startVoiceRuntime } from "./voice-runtime";
 
 const AGENTS = {
@@ -193,7 +194,7 @@ async function main(): Promise<void> {
     const [name, ...rest] = args.slice(1);
     try {
       if (name === "scout-context") {
-        const topic = rest.join(" ").trim();
+        const topic = stripWrappingQuotes(rest.join(" "));
         if (!topic) {
           console.error('sf: usage: sf workflow scout-context "<topic>"');
           process.exit(1);
@@ -207,7 +208,7 @@ async function main(): Promise<void> {
         process.exit(result.ok ? 0 : 1);
       }
       if (name === "spec-context") {
-        const topic = rest.join(" ").trim();
+        const topic = stripWrappingQuotes(rest.join(" "));
         if (!topic) {
           console.error('sf: usage: sf workflow spec-context "<task description>"');
           process.exit(1);
@@ -219,13 +220,14 @@ async function main(): Promise<void> {
           process.exit(130);
         }
         console.log(`\nsf: spec-context ${result.ok ? "succeeded" : "finished with unresolved gate failures"}`);
+        console.log(`  title:      ${result.title ? `${result.title} (${result.type})` : "(not named - build-feature will name it from the spec)"}`);
         console.log(`  workflowId: ${result.workflowId}`);
         console.log(`  spec.json:  ${result.specJsonPath}`);
         console.log(`  next: sf workflow build-feature ${result.workflowId}`);
         process.exit(result.ok ? 0 : 1);
       }
       if (name === "build-feature") {
-        const specInput = rest.join(" ").trim();
+        const specInput = stripWrappingQuotes(rest.join(" "));
         if (!specInput) {
           console.error("sf: usage: sf workflow build-feature <spec-json-path-or-workflowId>");
           process.exit(1);
@@ -237,6 +239,7 @@ async function main(): Promise<void> {
           process.exit(130);
         }
         console.log(`sf: build-feature ${result.ok ? "succeeded" : "failed"}`);
+        if (result.title) console.log(`  title: ${result.title}`);
         if (result.error) console.log(`  error: ${result.error}`);
         console.log(`  branch: ${result.branch || "(none - nothing was committed)"}`);
         if (result.prUrl) console.log(`  PR: ${result.prUrl}`);

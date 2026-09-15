@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { readAllEvents, summarizeSessions, type SfEvent } from "./dashboard";
+import { readAllEvents, summarizeSessions, workTitle, type SfEvent } from "./dashboard";
 import { ROOT_DIR } from "./home";
 import { findTranscriptPath } from "./pi-sessions";
 import { RUNS_DIR as BUILD_FEATURE_RUNS_DIR } from "./workflows/build-feature/config";
@@ -30,6 +30,8 @@ export interface ReportManifest {
   kind: "workflow" | "session";
   workflowName?: WorkflowName;
   topic?: string;
+  /** The work's name, when the workflow produced one (spec-context's planner, or build-feature from it). */
+  title?: string;
   status: "running" | "ended";
   reportMdPath?: string;
   lanes: ManifestLane[];
@@ -51,7 +53,7 @@ export function buildReportManifest(id: string): ReportManifest {
   const summary = summarizeSessions(readAllEvents()).find((s) => s.session_id === id);
   const isWorkflow = events.some((e) => e.workflow_id);
   const start = events.find((e) => e.type === "workflow_start");
-  const startData = start?.data as { topic?: string; workflow?: string } | undefined;
+  const startData = start?.data as { topic?: string; title?: string; workflow?: string } | undefined;
   const workflowName = isWorkflowName(startData?.workflow) ? startData?.workflow : undefined;
 
   const byRole = new Map<string, SfEvent[]>();
@@ -99,6 +101,7 @@ export function buildReportManifest(id: string): ReportManifest {
     kind: isWorkflow ? "workflow" : "session",
     workflowName,
     topic: startData?.topic,
+    title: workTitle(events) ?? startData?.title,
     status: summary?.status ?? "ended",
     reportMdPath,
     lanes,

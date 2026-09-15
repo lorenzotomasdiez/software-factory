@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { piExtensionArgs, piIsolationArgs } from "../../agent-launch";
 import { ensureDashboardRunning } from "../../dashboard";
 import { EVENTS_DIR, readBaseAgentPrompt } from "../../home";
@@ -33,15 +33,8 @@ import {
 import { resolveCommands } from "./commands";
 import { commitAll, deleteBranch, diffFiles, diffText, ensurePr, pushBranch, removeWorktree, runShell, setupWorktree } from "./git";
 import { clearWorkflow, registerWorkflow, throwIfCancelled, trackChild, untrackChild, WorkflowCancelledError } from "../cancel";
-
-// An agent is only stopped for being STUCK, not for being slow: a developer
-// editing a dozen files legitimately runs well past any fixed wall-clock
-// budget (a flat 15 min used to kill productive runs mid-edit). Activity =
-// any event the agent's pi extension appends to this workflow's event log.
-const AGENT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
-// Backstop for an agent that stays "active" forever (e.g. looping on a tool).
-const AGENT_MAX_RUNTIME_MS = 90 * 60 * 1000;
-const ACTIVITY_POLL_MS = 15 * 1000;
+import { watchAgent } from "../agent-watchdog";
+import { branchNameFor, nameWorkFromSpec, readWorkMetaNextTo, stripWrappingQuotes, writeWorkMeta, type WorkName } from "../work-title";
 
 interface SpawnResult {
   stdout: string;
@@ -101,44 +94,28 @@ async function spawnPi(opts: {
   });
 
   trackChild(opts.workflowId, proc.pid);
-  const startedAt = Date.now();
-  const eventsFile = join(EVENTS_DIR, `${opts.workflowId}.jsonl`);
-  let timedOut: string | undefined;
-  const watchdog = setInterval(() => {
-    const now = Date.now();
-    let lastActivity = startedAt;
-    try {
-      lastActivity = Math.max(startedAt, statSync(eventsFile).mtimeMs);
-    } catch {
-      // no events file yet - count from spawn time
-    }
-    if (now - lastActivity > AGENT_IDLE_TIMEOUT_MS) {
-      timedOut = `no activity for ${Math.round((now - lastActivity) / 60000)} min`;
-    } else if (now - startedAt > AGENT_MAX_RUNTIME_MS) {
-      timedOut = `exceeded the ${Math.round(AGENT_MAX_RUNTIME_MS / 60000)} min max runtime`;
-    }
-    if (timedOut) {
-      clearInterval(watchdog);
-      emitWorkflowEvent(opts.workflowId, opts.role, "agent_timeout", { reason: timedOut });
-      proc.kill();
-    }
-  }, ACTIVITY_POLL_MS);
+  const stopWatchdog = watchAgent(proc, opts.workflowId, opts.role);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  clearInterval(watchdog);
+  const timedOut = stopWatchdog();
   untrackChild(opts.workflowId, proc.pid);
   return { stdout, stderr, exitCode, timedOut };
 }
 
-function resolveSpecInput(input: string): { specPath: string; topic: string } {
+function resolveSpecInput(input: string): { specPath: string; topic: string; name?: WorkName } {
   const directPath = existsSync(input) ? input : null;
   const specPath = directPath ?? join(SPEC_RUNS_DIR, input, "spec.json");
   if (!existsSync(specPath)) {
     throw new Error(`build-feature: no spec.json found (checked "${input}" as a path, and as a spec-context workflowId at ${specPath})`);
   }
+  const meta = readWorkMetaNextTo(specPath);
+  if (meta) return { specPath, topic: meta.topic || meta.title, name: { title: meta.title, type: meta.type } };
+
+  // Not named yet (a spec from before spec-context named its work, or a
+  // hand-written one): the raw request is kept only as context for the namer.
   let topic = input;
   const eventsPath = join(EVENTS_DIR, `${input}.jsonl`);
   if (!directPath && existsSync(eventsPath)) {
@@ -147,7 +124,7 @@ function resolveSpecInput(input: string): { specPath: string; topic: string } {
       try {
         const evt = JSON.parse(line);
         if (evt.type === "workflow_start" && evt.data?.topic) {
-          topic = evt.data.topic;
+          topic = stripWrappingQuotes(evt.data.topic);
           break;
         }
       } catch {
@@ -158,6 +135,43 @@ function resolveSpecInput(input: string): { specPath: string; topic: string } {
   return { specPath, topic };
 }
 
+/**
+ * Names a spec that spec-context never named, from the spec's own content.
+ * Persists the name next to spec-context's own runs so a re-run reuses it;
+ * a hand-written spec.json elsewhere is never written next to.
+ */
+async function runNamer(
+  cfg: BuildFeatureConfig,
+  topic: string,
+  specPath: string,
+  specJson: string,
+  workflowId: string,
+  cwd: string,
+  dashboardUrl: string,
+): Promise<{ ok: true; name: WorkName } | { ok: false; error: string }> {
+  const role = "namer";
+  const { provider, model } = resolveModel(cfg, cfg.planner.modelKey);
+  emitWorkflowEvent(workflowId, role, "scout_start", { angle: "Work namer", provider, model });
+  const specMdPath = join(dirname(specPath), "spec.md");
+  const result = await nameWorkFromSpec({
+    topic,
+    specJson,
+    specMarkdown: existsSync(specMdPath) ? readFileSync(specMdPath, "utf-8") : undefined,
+    retries: cfg.retries,
+    run: (systemPrompt, prompt, attempt) =>
+      spawnPi({ provider, model, systemPrompt, prompt, sessionId: `sf-build-${workflowId}-namer-${attempt}`, cwd, workflowId, role, dashboardUrl, toolMode: "none" }),
+    onAttempt: (attempt, checks, error) => {
+      if (checks) emitWorkflowEvent(workflowId, role, "gate_result", { attempt, checks });
+      if (error) emitWorkflowEvent(workflowId, role, "scout_retry", { attempt, error });
+    },
+  });
+  emitWorkflowEvent(workflowId, role, "scout_end", result.ok ? { ok: true, ...result.name } : { ok: false, error: result.error });
+  if (result.ok && resolve(dirname(dirname(specPath))) === resolve(SPEC_RUNS_DIR)) {
+    writeWorkMeta(dirname(specPath), { workflowId: basename(dirname(specPath)), topic, ...result.name });
+  }
+  return result;
+}
+
 interface RunContext {
   cfg: BuildFeatureConfig;
   basePrompt: string;
@@ -165,6 +179,10 @@ interface RunContext {
   worktreePath: string;
   dashboardUrl: string;
   repoCwd: string;
+  /** The user's original request, verbatim. */
+  topic: string;
+  /** The work's name - commit subject, PR title and report heading. */
+  title: string;
   /** Whether the branch has real commits on the remote - no PR is attempted otherwise. */
   pushed: boolean;
 }
@@ -265,6 +283,8 @@ export interface BuildFeatureResult {
   /** Why it isn't ok, in one readable line - surfaced by the CLI and the pi command. */
   error?: string;
   topic: string;
+  /** Absent only when the work could not be named, which stops the run before any branch exists. */
+  title?: string;
   branch: string;
   prUrl?: string;
   reportPath: string;
@@ -288,7 +308,8 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
   cfg.buildCommand = commands.buildCommand;
   cfg.testCommand = commands.testCommand;
   cfg.baseBranch = commands.baseBranch;
-  const { specPath, topic } = resolveSpecInput(specInput);
+  const { specPath, topic, name: existingName } = resolveSpecInput(specInput);
+  let name = existingName;
   const spec = JSON.parse(readFileSync(specPath, "utf-8")) as Record<string, { id: string; text: string; refs?: string[] }[]>;
   const specJson = JSON.stringify(spec, null, 2);
   const mustCoverIds = [...(spec.requirements ?? []), ...(spec.acceptance ?? [])].map((i) => i.id);
@@ -304,8 +325,8 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
       const runDir = join(RUNS_DIR, workflowId);
       mkdirSync(runDir, { recursive: true });
       const reportPath = join(runDir, "report.md");
-      writeFileSync(reportPath, `# build-feature: ${topic}\n\n_Cancelled by the user before finishing._\n`);
-      return { workflowId, ok: false, cancelled: true, topic, branch: "", reportPath };
+      writeFileSync(reportPath, `# build-feature: ${name?.title ?? topic}\n\n_Cancelled by the user before finishing._\n`);
+      return { workflowId, ok: false, cancelled: true, topic, title: name?.title, branch: "", reportPath };
     }
     throw err;
   } finally {
@@ -326,10 +347,28 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
     commandSource: commands.source,
   });
 
-  const { path: worktreePath, branch } = await setupWorktree(cwd, workflowId, topic, cfg.baseBranch);
+  if (!name) {
+    const named = await runNamer(cfg, topic, specPath, specJson, workflowId, cwd, dashboardUrl);
+    if (!named.ok) {
+      // Fail before any branch exists: a branch named after the raw request
+      // ("feat/for-doing-phase-7-of-plan-md") is exactly what this prevents.
+      const error = `could not name the work from the spec: ${named.error}`;
+      const runDir = join(RUNS_DIR, workflowId);
+      mkdirSync(runDir, { recursive: true });
+      const reportPath = join(runDir, "report.md");
+      writeFileSync(reportPath, `# build-feature: ${topic}\n\nStopped before creating a branch.\n\n## Error\n${error}\n`);
+      emitWorkflowEvent(workflowId, "orchestrator", "workflow_end", { ok: false, reportPath, branch: "", error });
+      return { workflowId, ok: false, error, topic, branch: "", reportPath };
+    }
+    name = named.name;
+  }
+  const { title } = name;
+  emitWorkflowEvent(workflowId, "orchestrator", "workflow_title", { ...name, namedBy: existingName ? "spec-context" : "namer" });
+
+  const { path: worktreePath, branch } = await setupWorktree(cwd, workflowId, branchNameFor(name), cfg.baseBranch);
   emitWorkflowEvent(workflowId, "orchestrator", "branch_created", { branch, worktreePath });
 
-  const ctx: RunContext = { cfg, basePrompt, workflowId, worktreePath, dashboardUrl, repoCwd: cwd, pushed: false };
+  const ctx: RunContext = { cfg, basePrompt, workflowId, worktreePath, dashboardUrl, repoCwd: cwd, topic, title, pushed: false };
   const roleSystemPrompt = (role: string) => `You are the ${role} inside software-factory's \`build-feature\` workflow, implementing a feature from a pre-generated spec.`;
 
   // 1. Planner
@@ -342,7 +381,7 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
     (raw) => plannerGates(raw, mustCoverIds),
   );
   if (!planResult.ok || !planResult.envelope) {
-    return finish(ctx, topic, branch, false, `planner failed: ${planResult.error}`, specJson, "", "", "", "", false, false);
+    return finish(ctx, branch, false, `planner failed: ${planResult.error}`, specJson, "", "", "", "", false, false);
   }
   const planJson = JSON.stringify(planResult.envelope, null, 2);
   const planStepIds = planResult.envelope.steps.map((s) => s.id);
@@ -357,7 +396,7 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
     (raw) => architectGates(raw, planStepIds),
   );
   if (!archResult.ok || !archResult.envelope) {
-    return finish(ctx, topic, branch, false, `architect failed: ${archResult.error}`, specJson, planJson, "", "", "", false, false);
+    return finish(ctx, branch, false, `architect failed: ${archResult.error}`, specJson, planJson, "", "", "", false, false);
   }
   const architectureJson = JSON.stringify(archResult.envelope, null, 2);
 
@@ -489,7 +528,7 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
 
   // Commit and push whatever real work exists, even if tests never passed -
   // never silently throw away a developer's changes because of an exit code.
-  const committed = await commitAll(worktreePath, `sf build-feature: ${topic}`);
+  const committed = await commitAll(worktreePath, title);
   if (committed) {
     const push = await pushBranch(worktreePath, branch);
     ctx.pushed = push.exitCode === 0;
@@ -523,7 +562,6 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
   const ok = Boolean(reviewResult.ok && reviewResult.envelope?.readyForReview);
   return finish(
     ctx,
-    topic,
     branch,
     ok,
     reviewResult.error,
@@ -540,7 +578,6 @@ export async function runBuildFeature(specInput: string, cwd = process.cwd()): P
 
 async function finish(
   ctx: RunContext,
-  topic: string,
   branch: string,
   ok: boolean,
   error: string | undefined,
@@ -565,8 +602,9 @@ async function finish(
   }
 
   const reportLines = [
-    `# build-feature: ${topic}`,
+    `# build-feature: ${ctx.title}`,
     "",
+    `Request: ${ctx.topic}`,
     `Branch: ${branch ? `\`${branch}\`` : "(none - removed, nothing was committed)"}`,
     `Build: ${buildOk ? "passed" : "failed"} · Tests: ${testOk ? "passed" : "failed"} · Overall: ${ok ? "ready" : "needs attention"}`,
     "",
@@ -587,11 +625,12 @@ async function finish(
   let prUrl: string | undefined;
   if (!ctx.pushed) {
     emitWorkflowEvent(ctx.workflowId, "orchestrator", "workflow_end", { ok, reportPath, branch, buildOk, testOk, error });
-    return { workflowId: ctx.workflowId, ok, error, topic, branch, reportPath };
+    return { workflowId: ctx.workflowId, ok, error, topic: ctx.topic, title: ctx.title, branch, reportPath };
   }
   try {
-    const title = `[sf] ${topic}`.slice(0, 120);
     const body = [
+      `> ${ctx.topic.split("\n").join("\n> ")}`,
+      "",
       `Generated by \`sf workflow build-feature\` (workflow \`${ctx.workflowId}\`).`,
       "",
       `**Status:** ${ok ? "✅ ready for review" : "⚠️ needs attention - see gate failures in the dashboard"}`,
@@ -601,7 +640,7 @@ async function finish(
       "",
       `Full event trace: see \`sf dashboard\` for workflow \`${ctx.workflowId}\`.`,
     ].join("\n");
-    const pr = await ensurePr(process.cwd(), branch, ctx.cfg.baseBranch, title, body);
+    const pr = await ensurePr(process.cwd(), branch, ctx.cfg.baseBranch, ctx.title, body);
     prUrl = pr.url;
   } catch (err) {
     emitWorkflowEvent(ctx.workflowId, "orchestrator", "pr_error", { error: err instanceof Error ? err.message : String(err) });
@@ -609,7 +648,7 @@ async function finish(
 
   emitWorkflowEvent(ctx.workflowId, "orchestrator", "workflow_end", { ok, reportPath, branch, prUrl, buildOk, testOk, error });
 
-  return { workflowId: ctx.workflowId, ok, error, topic, branch, prUrl, reportPath };
+  return { workflowId: ctx.workflowId, ok, error, topic: ctx.topic, title: ctx.title, branch, prUrl, reportPath };
 }
 
 async function branchHasCommits(ctx: RunContext): Promise<boolean> {

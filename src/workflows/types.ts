@@ -1,5 +1,6 @@
 import type { ScoutEnvelope } from "./scout-context/gates";
 import type { SectionEnvelope, SectionName } from "./spec-context/gates";
+import type { WorkType } from "./work-title";
 
 export interface ScoutResult {
   role: string;
@@ -35,6 +36,9 @@ export interface SpecContextWorkflowResult {
   ok: boolean;
   cancelled?: boolean;
   topic: string;
+  /** Absent only when neither the planner nor the namer produced a valid name. */
+  title?: string;
+  type?: WorkType;
   sections: SpecSectionResult[];
   markdown: string;
   specJson: string;

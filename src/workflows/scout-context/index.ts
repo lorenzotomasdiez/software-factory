@@ -19,8 +19,7 @@ import {
 import { extractJson, isScoutEnvelope, reviewerGates, scoutGates } from "./gates";
 import { promptTitle, renderTemplate } from "./prompts";
 import { clearWorkflow, registerWorkflow, throwIfCancelled, trackChild, untrackChild, WorkflowCancelledError } from "../cancel";
-
-const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
+import { watchAgent } from "../agent-watchdog";
 
 interface SpawnResult {
   stdout: string;
@@ -79,15 +78,17 @@ async function spawnPi(opts: {
   });
 
   trackChild(opts.workflowId, proc.pid);
-  const timeout = setTimeout(() => proc.kill(), AGENT_TIMEOUT_MS);
+  const stopWatchdog = watchAgent(proc, opts.workflowId, opts.role);
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  clearTimeout(timeout);
+  const timedOut = stopWatchdog();
   untrackChild(opts.workflowId, proc.pid);
-  return { stdout, stderr, exitCode };
+  // A harness kill leaves only pi's incidental startup noise on stderr (e.g.
+  // "No project session found..."), which callers would report as the cause.
+  return { stdout, stderr: timedOut ? `agent stopped by the harness: ${timedOut}` : stderr, exitCode: timedOut ? exitCode || 1 : exitCode };
 }
 
 async function runScout(

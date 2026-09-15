@@ -61,6 +61,12 @@ export interface SessionSummary {
   lanes?: Lane[];
 }
 
+/** spec-context only learns the work's real name after its planner runs, so it arrives as a later workflow_title event. */
+export function workTitle(events: SfEvent[]): string | undefined {
+  const evt = [...events].reverse().find((e) => e.type === "workflow_title");
+  return (evt?.data as { title?: string } | undefined)?.title;
+}
+
 /** Groups by workflow_id when present (orchestrator + all its scout lanes together), else by session_id. */
 export function summarizeSessions(events: SfEvent[]): SessionSummary[] {
   const groups = new Map<string, SfEvent[]>();
@@ -102,8 +108,8 @@ export function summarizeSessions(events: SfEvent[]): SessionSummary[] {
           tool_count: roleEvts.filter((e) => e.type === "tool_call").length,
         }));
       const start = evts.find((e) => e.type === "workflow_start");
-      const startData = start?.data as { topic?: string; workflow?: string } | undefined;
-      topic = startData?.topic;
+      const startData = start?.data as { topic?: string; title?: string; workflow?: string } | undefined;
+      topic = workTitle(evts) ?? startData?.title ?? startData?.topic;
       workflowName = startData?.workflow;
     }
     summaries.push({

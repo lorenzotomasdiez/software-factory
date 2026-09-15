@@ -1,4 +1,5 @@
 import { extractJson, type GateCheck } from "../scout-context/gates";
+import { isWorkType, workNameGates, type WorkType } from "../work-title";
 
 export { extractJson, type GateCheck };
 
@@ -18,6 +19,9 @@ export interface SectionEnvelope {
 
 export interface PlannerEnvelope {
   sections: SectionName[];
+  /** Short imperative name of the work - becomes the branch, commit subject and PR title downstream. */
+  title: string;
+  type: WorkType;
 }
 
 export interface ReviewerOutput {
@@ -29,10 +33,14 @@ function isKnownSection(value: unknown): value is SectionName {
   return typeof value === "string" && (KNOWN_SECTIONS as readonly string[]).includes(value);
 }
 
+function hasValidSections(v: Record<string, unknown>): boolean {
+  return Array.isArray(v.sections) && v.sections.length > 0 && v.sections.every(isKnownSection);
+}
+
 export function isPlannerEnvelope(value: unknown): value is PlannerEnvelope {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
-  return Array.isArray(v.sections) && v.sections.length > 0 && v.sections.every(isKnownSection);
+  return hasValidSections(v) && typeof v.title === "string" && v.title.trim().length > 0 && isWorkType(v.type);
 }
 
 function isSpecItem(value: unknown): value is SpecItem {
@@ -66,15 +74,17 @@ function isReviewerOutput(value: unknown): value is ReviewerOutput {
   return Object.entries(spec).every(([key, items]) => isKnownSection(key) && Array.isArray(items) && items.every(isSpecItem));
 }
 
-/** Deterministic, mechanical check on the planner's chosen section list. */
-export function plannerGates(raw: unknown): GateCheck[] {
-  const ok = isPlannerEnvelope(raw);
+/** Deterministic, mechanical checks on the planner's chosen section list and work title. */
+export function plannerGates(raw: unknown, topic: string): GateCheck[] {
+  const v = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const sectionsOk = hasValidSections(v);
   return [
     {
       name: "envelope_shape",
-      ok,
-      detail: ok ? `sections: ${(raw as PlannerEnvelope).sections.join(", ")}` : "missing/malformed sections[] (must be non-empty, from the known set)",
+      ok: sectionsOk,
+      detail: sectionsOk ? `sections: ${(v.sections as string[]).join(", ")}` : "missing/malformed sections[] (must be non-empty, from the known set)",
     },
+    ...workNameGates(raw, topic),
   ];
 }
 

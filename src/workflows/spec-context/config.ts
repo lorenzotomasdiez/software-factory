@@ -43,7 +43,7 @@ const DEFAULT_CONFIG: SpecContextConfig = {
     // (or the planner) also uses, so the merge step isn't graded by the same
     // model that wrote (some of) the material it's merging.
     luna: { provider: "openai-codex", model: "gpt-5.6-luna" },
-    deepseek: { provider: "openrouter", model: "deepseek/deepseek-v3.2" },
+    deepseek: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     sonnet: { provider: "openrouter", model: "anthropic/claude-sonnet-5" },
     opus: { provider: "openrouter", model: "anthropic/claude-opus-5" },
     // Kimi subscription (OAuth-logged in pi), not pay-per-token OpenRouter.
@@ -82,10 +82,12 @@ refactor may not need "interfaces").
 
 Known sections: requirements, interfaces, constraints, acceptance, edge_cases
 
+Also name the work (see the naming rules appended below).
+
 Rules:
 - End your final message with EXACTLY ONE fenced json block, nothing after it, in this shape:
 \`\`\`json
-{"sections": ["requirements", "acceptance"]}
+{"sections": ["requirements", "acceptance"], "title": "Add OAuth login to the admin panel", "type": "feat"}
 \`\`\`
 `,
   "requirements.md": `# Requirements
@@ -203,7 +205,8 @@ export function ensureSpecContextConfig(): void {
  * config.json is only written once, so fixes to DEFAULT_CONFIG never reach an
  * existing install on their own. This upgrades values that are still exactly
  * an old shipped default (never anything the user changed by hand):
- * - moves "kimi" off OpenRouter onto the kimi-coding subscription provider.
+ * - moves "kimi" off OpenRouter onto the kimi-coding subscription provider,
+ * - moves "deepseek" from v3.2 to v4.1-flash.
  */
 function migrateConfigFile(): void {
   let cfg: SpecContextConfig;
@@ -212,11 +215,18 @@ function migrateConfigFile(): void {
   } catch {
     return; // leave a broken file for loadSpecContextConfig to report clearly
   }
+  let changed = false;
   const kimi = cfg.models?.kimi;
   if (kimi?.provider === "openrouter" && kimi?.model === "moonshotai/kimi-k2") {
     cfg.models.kimi = DEFAULT_CONFIG.models.kimi;
-    writeFileSync(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`);
+    changed = true;
   }
+  const deepseek = cfg.models?.deepseek;
+  if (deepseek?.provider === "openrouter" && deepseek?.model === "deepseek/deepseek-v3.2") {
+    cfg.models.deepseek = DEFAULT_CONFIG.models.deepseek;
+    changed = true;
+  }
+  if (changed) writeFileSync(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`);
 }
 
 export function loadSpecContextConfig(): SpecContextConfig {

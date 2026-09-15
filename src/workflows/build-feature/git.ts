@@ -2,10 +2,6 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { WORKTREES_DIR } from "./config";
 
-export function slugify(text: string): string {
-  return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 50) || "feature";
-}
-
 export interface ExecResult {
   stdout: string;
   stderr: string;
@@ -46,20 +42,42 @@ export async function runShell(command: string, cwd: string): Promise<ExecResult
 export async function setupWorktree(
   repoCwd: string,
   workflowId: string,
-  topic: string,
+  preferredBranch: string,
   baseBranch: string,
 ): Promise<{ path: string; branch: string }> {
   mkdirSync(WORKTREES_DIR, { recursive: true });
-  const branch = `sf/${slugify(topic)}-${workflowId.slice(0, 8)}`;
   const path = join(WORKTREES_DIR, workflowId);
 
   const fetch = await run(["git", "fetch", "origin", baseBranch], repoCwd);
   if (fetch.exitCode !== 0) throw new Error(`git fetch origin ${baseBranch} failed: ${fetch.stderr.trim()}`);
 
+  const branch = await firstFreeBranchName(repoCwd, preferredBranch);
+
   const add = await run(["git", "worktree", "add", "-b", branch, path, `origin/${baseBranch}`], repoCwd);
   if (add.exitCode !== 0) throw new Error(`git worktree add failed: ${add.stderr.trim()}`);
 
   return { path, branch };
+}
+
+/**
+ * Re-running build-feature on the same spec must not collide with (or push
+ * onto) an earlier run's branch, so a taken name gets a -2, -3... suffix -
+ * checked both locally and on origin, since either one makes `worktree add -b`
+ * or the later push fail.
+ */
+async function firstFreeBranchName(repoCwd: string, preferred: string): Promise<string> {
+  const remote = await run(["git", "ls-remote", "--heads", "origin", `${preferred}*`], repoCwd);
+  const remoteNames = new Set(
+    remote.stdout
+      .split("\n")
+      .map((l) => l.split("\t")[1]?.replace(/^refs\/heads\//, ""))
+      .filter(Boolean),
+  );
+  for (let n = 1; ; n++) {
+    const candidate = n === 1 ? preferred : `${preferred}-${n}`;
+    const local = await run(["git", "show-ref", "--verify", "--quiet", `refs/heads/${candidate}`], repoCwd);
+    if (local.exitCode !== 0 && !remoteNames.has(candidate)) return candidate;
+  }
 }
 
 export async function removeWorktree(repoCwd: string, worktreePath: string): Promise<void> {
