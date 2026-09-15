@@ -4,8 +4,12 @@ import { ProfileNotFoundError, listProfiles, resolveSystemPrompt } from "./profi
 import { DEFAULT_DASHBOARD_PORT, ensureDashboardRunning, startDashboard } from "./dashboard";
 import { claudeIsolationArgs, piExtensionArgs, piIsolationArgs } from "./agent-launch";
 import { runBuildFeature } from "./workflows/build-feature";
+import { ensureBuildFeatureConfig, syncBuildFeaturePrompts } from "./workflows/build-feature/config";
+import type { PromptSyncResult } from "./workflows/prompt-sync";
 import { runScoutContext } from "./workflows/scout-context";
+import { ensureScoutContextConfig, syncScoutContextPrompts } from "./workflows/scout-context/config";
 import { runSpecContext } from "./workflows/spec-context";
+import { ensureSpecContextConfig, syncSpecContextPrompts } from "./workflows/spec-context/config";
 import { stripWrappingQuotes } from "./workflows/work-title";
 import { startVoiceRuntime } from "./voice-runtime";
 
@@ -30,6 +34,7 @@ Usage:
   sf workflow scout-context "<topic>"
   sf workflow spec-context "<task description>"
   sf workflow build-feature <spec-json-path-or-workflowId>
+  sf workflow sync-prompts [--force]
   sf --help
 
 Agents:
@@ -68,9 +73,24 @@ Workflows:
                   own work. Takes a spec-context workflowId or a direct path
                   to a spec.json.
 
+  sync-prompts    Updates every workflow's installed prompts/*.md to the
+                  defaults shipped in this build of sf. A file is only
+                  touched when it's missing or still byte-for-byte the
+                  default this install last wrote (tracked in
+                  prompts/.defaults-manifest.json) - a prompt you edited by
+                  hand is always left alone and reported as skipped instead.
+                  Pass --force to overwrite skipped files anyway (also
+                  needed the very first time this runs against an existing
+                  install, since there's no recorded history yet to tell an
+                  old shipped default apart from a hand edit).
+                  Never runs automatically - always explicit, so local edits
+                  stay untouched until you choose to sync.
+
 Options:
   --profile <name>   Optional add-on profile, appended on top of the base prompt
                       voice-only adds asynchronous Kokoro TTS for assistant replies
+                      prompt-engineer engineers prompts from a local knowledge base
+                      and copies the <improved_prompt> block to the clipboard
 
 Voice-only setup:
   SF_KOKORO_URL       Kokoro OpenAI-compatible endpoint (default: http://127.0.0.1:8880/v1/audio/speech)
@@ -78,6 +98,14 @@ Voice-only setup:
   SF_AUDIO_PLAYER     Optional player executable override (macOS defaults to afplay)
   Automatic Kokoro uses localhost port 49637, pinned uv/package/model hashes,
   and stops its local process when the Pi session exits.
+
+Prompt-engineer setup:
+  SF_PROMPT_ENGINEER_SOURCE   Repo to resync the knowledge base from on every
+                               launch (default: ~/projects/prompt-engineer);
+                               every top-level *.md file there except
+                               AGENTS.md/CLAUDE.md is copied in as a guide
+  SF_CLIPBOARD_COMMAND        Override clipboard command (default: pbcopy on
+                               macOS, xclip on Linux)
 
 Observability:
   Every \`sf claude\`/\`sf pi\` launch auto-starts a local event dashboard
@@ -88,9 +116,11 @@ Observability:
 Config lives in ${ROOT_DIR}:
   AGENT.md            base system prompt, always applied
   profiles/<name>/AGENT.md   optional add-on, applied with --profile <name>
+  profiles/prompt-engineer/knowledge/   resynced guide files (read-only, regenerated)
   config.json         harness config, incl. default --provider/--model per agent
   extensions/default.ts       observability extension
   extensions/voice-only.ts    Kokoro TTS extension for the voice-only profile
+  extensions/prompt-engineer.ts   clipboard-copy extension for the prompt-engineer profile
   hooks/              reserved for future harness hooks
   events/             per-session JSONL event trace, read by \`sf dashboard\`
   workflows/scout-context/config.json   models/scouts/reviewer registry
@@ -193,6 +223,30 @@ async function main(): Promise<void> {
   if (first === "workflow") {
     const [name, ...rest] = args.slice(1);
     try {
+      if (name === "sync-prompts") {
+        const force = rest.includes("--force");
+        ensureScoutContextConfig();
+        ensureSpecContextConfig();
+        ensureBuildFeatureConfig();
+        const results: [string, PromptSyncResult][] = [
+          ["scout-context", syncScoutContextPrompts({ force })],
+          ["spec-context", syncSpecContextPrompts({ force })],
+          ["build-feature", syncBuildFeaturePrompts({ force })],
+        ];
+        let anyProblem = false;
+        for (const [workflow, result] of results) {
+          console.log(`${workflow}:`);
+          if (result.created.length) console.log(`  created: ${result.created.join(", ")}`);
+          if (result.updated.length) console.log(`  updated: ${result.updated.join(", ")}`);
+          if (result.skipped.length) {
+            anyProblem = true;
+            for (const { file, reason } of result.skipped) console.log(`  skipped: ${file} (${reason})`);
+          }
+          if (!result.created.length && !result.updated.length && !result.skipped.length) console.log("  up to date");
+        }
+        if (anyProblem) console.log("\nsf: some prompts were skipped because they no longer match the shipped default - rerun with --force to overwrite them anyway, or update those by hand.");
+        process.exit(0);
+      }
       if (name === "scout-context") {
         const topic = stripWrappingQuotes(rest.join(" "));
         if (!topic) {
@@ -254,7 +308,7 @@ async function main(): Promise<void> {
       console.error(`sf: workflow "${name}" failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
     }
-    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context, spec-context, build-feature`);
+    console.error(`sf: unknown workflow "${name}". Expected one of: scout-context, spec-context, build-feature, sync-prompts`);
     process.exit(1);
   }
 

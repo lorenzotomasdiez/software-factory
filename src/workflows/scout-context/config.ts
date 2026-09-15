@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT_DIR } from "../../home";
+import { syncDefaultPrompts, type PromptSyncResult } from "../prompt-sync";
 
 export const WORKFLOW_DIR = join(ROOT_DIR, "workflows", "scout-context");
 export const PROMPTS_DIR = join(WORKFLOW_DIR, "prompts");
@@ -114,6 +115,11 @@ export function ensureScoutContextConfig(): void {
     const path = join(PROMPTS_DIR, file);
     if (!existsSync(path)) writeFileSync(path, content);
   }
+}
+
+/** Updates on-disk prompts/*.md to the defaults shipped in this build, skipping any the user edited by hand. */
+export function syncScoutContextPrompts(opts: { force?: boolean } = {}): PromptSyncResult {
+  return syncDefaultPrompts(PROMPTS_DIR, DEFAULT_PROMPTS, opts);
 }
 
 export function loadScoutContextConfig(): ScoutContextConfig {

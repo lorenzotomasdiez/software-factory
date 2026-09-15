@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT_DIR } from "../../home";
+import { syncDefaultPrompts, type PromptSyncResult } from "../prompt-sync";
 
 export const WORKFLOW_DIR = join(ROOT_DIR, "workflows", "build-feature");
 export const PROMPTS_DIR = join(WORKFLOW_DIR, "prompts");
@@ -276,6 +277,11 @@ function migrateConfigFile(): void {
   }
 
   if (changed) writeFileSync(CONFIG_FILE, `${JSON.stringify(cfg, null, 2)}\n`);
+}
+
+/** Updates on-disk prompts/*.md to the defaults shipped in this build, skipping any the user edited by hand. */
+export function syncBuildFeaturePrompts(opts: { force?: boolean } = {}): PromptSyncResult {
+  return syncDefaultPrompts(PROMPTS_DIR, DEFAULT_PROMPTS, opts);
 }
 
 export function loadBuildFeatureConfig(): BuildFeatureConfig {

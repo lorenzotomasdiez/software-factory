@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,10 @@ export const EXTENSIONS_DIR = join(ROOT_DIR, "extensions");
 export const DEFAULT_EXTENSION_FILE = join(EXTENSIONS_DIR, "default.ts");
 export const VOICE_EXTENSION_FILE = join(EXTENSIONS_DIR, "voice-only.ts");
 export const VOICE_PROFILE_FILE = join(PROFILES_DIR, "voice-only", "AGENT.md");
+export const PROMPT_ENGINEER_EXTENSION_FILE = join(EXTENSIONS_DIR, "prompt-engineer.ts");
+export const PROMPT_ENGINEER_PROFILE_DIR = join(PROFILES_DIR, "prompt-engineer");
+export const PROMPT_ENGINEER_PROFILE_FILE = join(PROMPT_ENGINEER_PROFILE_DIR, "AGENT.md");
+export const PROMPT_ENGINEER_KNOWLEDGE_DIR = join(PROMPT_ENGINEER_PROFILE_DIR, "knowledge");
 export const HOOKS_DIR = join(ROOT_DIR, "hooks");
 export const EVENTS_DIR = join(ROOT_DIR, "events");
 
@@ -597,6 +601,136 @@ export default function (pi: ExtensionAPI) {
 }
 `;
 
+const DEFAULT_PROMPT_ENGINEER_PROFILE = `# Prompt engineer profile
+
+<role>
+You are an expert prompt engineer with deep expertise in optimising prompts for Claude, Gemini, GPT, Kimi, Qwen, and DeepSeek models. You have a local knowledge base you MUST consult when engineering prompts - never rely on memory alone for model-specific behaviour (effort/thinking parameters, tokenizer quirks, context limits, licensing, tool syntax).
+</role>
+
+<knowledge_base>
+Your knowledge base lives at ${PROMPT_ENGINEER_KNOWLEDGE_DIR} and is resynced from the source prompting repo on every \`sf\` launch, so new files can appear over time - list the directory if you suspect it grew since your training and treat any new file the same way as the ones below.
+
+Always start with prompt-guide.md (foundational techniques: architecture, XML structuring, role engineering, few-shot patterns, chain-of-thought, output control, long context, agentic prompting, QA). Then layer the model-specific file for whichever model/tool the user is targeting - ask which model if it isn't stated and the advice would materially differ by model. Read files directly from the knowledge base rather than answering from memory; the guides are the source of truth.
+</knowledge_base>
+
+<process>
+1. Analyse intent: task, target model/tool, desired output format, audience, complexity (simple/moderate/complex/advanced).
+2. Consult the knowledge base: read prompt-guide.md plus the relevant model-specific file(s) before drafting anything.
+3. Select techniques matched to complexity - simple: clear instructions + format; moderate: few-shot + XML + role; complex: chain-of-thought + multi-step + quality bar; advanced: extended thinking + agentic + multi-agent patterns.
+4. Construct the prompt in this order: role/expertise, context, numbered instructions, 3-5 examples if useful, output format, quality criteria, input placeholder.
+5. Apply the target model's specific optimisations from its guide file.
+6. Validate: every user requirement is addressed, techniques are justified, no vague or purely negative instructions remain, output format is fully specified.
+</process>
+
+<output_format>
+Structure every reply exactly like this:
+
+<analysis>
+Brief read on the user's requirements and complexity.
+</analysis>
+
+<techniques_applied>
+Techniques used, each with the specific doc/section it came from.
+</techniques_applied>
+
+<improved_prompt>
+ONLY the finished, ready-to-paste prompt text goes here - nothing else. No headers, no meta-commentary, no "Here's your prompt:". This exact block is copied to the clipboard automatically right after you send this reply, so anything outside these tags never reaches the clipboard, and anything meta placed inside them would get pasted by mistake into whatever the user is working on.
+</improved_prompt>
+
+<explanation>
+Key improvements made and why, referencing the knowledge base.
+</explanation>
+
+<usage_notes>
+Recommended model/config and suggestions for iteration.
+</usage_notes>
+</output_format>
+
+<interaction_guidelines>
+- Reasoning, tradeoffs, and back-and-forth belong in this conversation window, never inside <improved_prompt> - that block must always be self-contained and directly pasteable on its own.
+- If the user flags something wrong with a previous version, fix it and re-emit the full output_format block, including a corrected <improved_prompt> - each reply's block is what gets copied, so always regenerate it in full, even for a small tweak, rather than describing the change in prose.
+- If the user doesn't name a target model and it changes the advice meaningfully, ask before assuming one.
+- Prefer positive instructions, explain the reasoning behind rules ("why", not just "what"), and state quality bars in checkable terms rather than adjectives, per prompt-guide.md's core principles.
+- Avoid anti-patterns: vague instructions, negative-only framing, missing context, unspecified output format.
+`;
+
+const DEFAULT_PROMPT_ENGINEER_EXTENSION = `// software-factory prompt-engineer profile extension.
+// Copies the <improved_prompt>...</improved_prompt> block of each assistant
+// reply to the system clipboard, so the finished prompt is always one paste
+// away. Reasoning and iteration stay in the conversation window - only the
+// tagged block ever touches the clipboard, and it is overwritten on every
+// reply so a corrected version always replaces the previous one.
+
+import { spawn } from "node:child_process";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+const PROFILE = "prompt-engineer";
+const PROMPT_BLOCK_RE = /<improved_prompt>([\\s\\S]*?)<\\/improved_prompt>/;
+
+function isPromptEngineerProfile(): boolean {
+  return process.env.SF_PROFILE === PROFILE;
+}
+
+function clipboardCommand(): [string, string[]] | undefined {
+  if (process.env.SF_CLIPBOARD_COMMAND) return ["sh", ["-c", process.env.SF_CLIPBOARD_COMMAND]];
+  if (process.platform === "darwin") return ["pbcopy", []];
+  if (process.platform === "linux") return ["xclip", ["-selection", "clipboard"]];
+  return undefined;
+}
+
+function copyToClipboard(text: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const command = clipboardCommand();
+    if (!command) return reject(new Error("No clipboard command available. Set SF_CLIPBOARD_COMMAND."));
+    const [bin, args] = command;
+    const child = spawn(bin, args, { stdio: ["pipe", "ignore", "pipe"] });
+    let errorOutput = "";
+    child.stderr?.on("data", (chunk) => { errorOutput += String(chunk); });
+    child.once("error", (error) => reject(error));
+    child.once("close", (code) => {
+      if (code !== 0) return reject(new Error(errorOutput.trim() || \`clipboard command exited \${code}\`));
+      resolve();
+    });
+    try {
+      child.stdin?.write(text);
+      child.stdin?.end();
+    } catch (error) {
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+function extractPromptBlock(message: unknown): string | undefined {
+  const value = message as { role?: string; stopReason?: string; content?: unknown };
+  if (value.role !== "assistant" || value.stopReason === "toolUse") return undefined;
+
+  const blocks = Array.isArray(value.content) ? value.content : [{ type: "text", text: value.content }];
+  const text = blocks
+    .filter((block) => (block as { type?: string }).type === "text")
+    .map((block) => String((block as { text?: unknown }).text ?? ""))
+    .join("\\n");
+
+  const match = text.match(PROMPT_BLOCK_RE);
+  const prompt = match?.[1]?.trim();
+  return prompt || undefined;
+}
+
+export default function (pi: ExtensionAPI) {
+  pi.on("message_end", async (event, ctx) => {
+    if (!isPromptEngineerProfile()) return;
+    const prompt = extractPromptBlock(event.message);
+    if (!prompt) return;
+    try {
+      await copyToClipboard(prompt);
+      ctx.ui.notify("Prompt copied to clipboard.", "info");
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(\`Could not copy prompt to clipboard: \${messageText}\`, "error");
+    }
+  });
+}
+`;
+
 const DEFAULT_CONFIG: SfConfig = {
   agents: {
     claude: { model: "claude-opus-5" },
@@ -604,11 +738,29 @@ const DEFAULT_CONFIG: SfConfig = {
   },
 };
 
+// Source repo for the prompt-engineer profile's knowledge base (prompt-guide.md
+// plus one file per model). Resynced into PROMPT_ENGINEER_KNOWLEDGE_DIR on every
+// ensureHome() call so the profile's knowledge grows as that repo grows, with no
+// separate "resync" step to remember.
+const PROMPT_ENGINEER_SOURCE_DIR = process.env.SF_PROMPT_ENGINEER_SOURCE || join(homedir(), "projects", "prompt-engineer");
+
+function syncPromptEngineerKnowledge(): void {
+  if (!existsSync(PROMPT_ENGINEER_SOURCE_DIR)) return;
+  mkdirSync(PROMPT_ENGINEER_KNOWLEDGE_DIR, { recursive: true });
+  for (const file of readdirSync(PROMPT_ENGINEER_SOURCE_DIR)) {
+    // AGENTS.md/CLAUDE.md are the source repo's OWN agent instructions, not a
+    // reference guide - the profile's AGENT.md replaces that role, so skip them.
+    if (!file.endsWith(".md") || file === "AGENTS.md" || file === "CLAUDE.md") continue;
+    copyFileSync(join(PROMPT_ENGINEER_SOURCE_DIR, file), join(PROMPT_ENGINEER_KNOWLEDGE_DIR, file));
+  }
+}
+
 export function ensureHome(): void {
   mkdirSync(ROOT_DIR, { recursive: true });
   mkdirSync(PROFILES_DIR, { recursive: true });
   mkdirSync(EXTENSIONS_DIR, { recursive: true });
   mkdirSync(join(PROFILES_DIR, "voice-only"), { recursive: true });
+  mkdirSync(PROMPT_ENGINEER_PROFILE_DIR, { recursive: true });
   mkdirSync(HOOKS_DIR, { recursive: true });
   mkdirSync(EVENTS_DIR, { recursive: true });
 
@@ -627,6 +779,13 @@ export function ensureHome(): void {
   if (!existsSync(VOICE_PROFILE_FILE)) {
     writeFileSync(VOICE_PROFILE_FILE, DEFAULT_VOICE_PROFILE);
   }
+  if (!existsSync(PROMPT_ENGINEER_EXTENSION_FILE)) {
+    writeFileSync(PROMPT_ENGINEER_EXTENSION_FILE, DEFAULT_PROMPT_ENGINEER_EXTENSION);
+  }
+  if (!existsSync(PROMPT_ENGINEER_PROFILE_FILE)) {
+    writeFileSync(PROMPT_ENGINEER_PROFILE_FILE, DEFAULT_PROMPT_ENGINEER_PROFILE);
+  }
+  syncPromptEngineerKnowledge();
 }
 
 export function readBaseAgentPrompt(): string {

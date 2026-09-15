@@ -1,4 +1,4 @@
-import { DEFAULT_EXTENSION_FILE, VOICE_EXTENSION_FILE } from "./home";
+import { DEFAULT_EXTENSION_FILE, PROMPT_ENGINEER_EXTENSION_FILE, VOICE_EXTENSION_FILE } from "./home";
 
 /**
  * Isolation flags so a launched session only ever sees software-factory's own
@@ -16,5 +16,6 @@ export function claudeIsolationArgs(): string[] {
 export function piExtensionArgs(profile?: string): string[] {
   const args = ["-e", DEFAULT_EXTENSION_FILE];
   if (profile === "voice-only") args.push("-e", VOICE_EXTENSION_FILE);
+  if (profile === "prompt-engineer") args.push("-e", PROMPT_ENGINEER_EXTENSION_FILE);
   return args;
 }
